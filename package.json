@@ -1,0 +1,37 @@
+{
+  "name": "tidymac",
+  "version": "0.1.0",
+  "description": "macOS 개발 워크플로를 위한 시스템 리소스 스캔 및 정리 CLI",
+  "type": "module",
+  "bin": {
+    "tidymac": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "tsup --config tsup.config.ts",
+    "dev": "tsx src/cli.ts"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "packageManager": "pnpm@9.15.9",
+  "dependencies": {
+    "chalk": "^5.4.1",
+    "commander": "^12.1.0",
+    "execa": "^9.5.2",
+    "inquirer": "^9.3.7",
+    "ora": "^8.1.1",
+    "pretty-bytes": "^6.1.1"
+  },
+  "devDependencies": {
+    "@types/inquirer": "^9.0.8",
+    "@types/node": "^22.10.2",
+    "tsup": "^8.3.5",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
