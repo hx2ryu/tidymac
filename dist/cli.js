@@ -30717,6 +30717,7 @@ var require_cross_spawn = __commonJS({
 init_esm_shims();
 import { randomUUID as randomUUID2 } from "crypto";
 import { platform as platform2 } from "os";
+import { setTimeout as sleep } from "timers/promises";
 
 // node_modules/.pnpm/chalk@5.6.2/node_modules/chalk/source/index.js
 init_esm_shims();
@@ -42395,6 +42396,11 @@ var RISK_LABELS = {
   caution: "\uC8FC\uC758",
   danger: "\uC704\uD5D8"
 };
+var RISK_COLORS = {
+  safe: source_default.green,
+  caution: source_default.yellow,
+  danger: source_default.red
+};
 var SCANNERS = {
   memory: scanMemory,
   disk: scanDisk,
@@ -42418,6 +42424,80 @@ function parseCategory(category) {
 }
 function formatBytes(bytes) {
   return bytes === null ? source_default.gray("\uD06C\uAE30 \uBBF8\uD655\uC815") : prettyBytes(bytes);
+}
+function formatPercent(value) {
+  return `${Math.round(value * 100)}%`;
+}
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+function padLabel(label, width) {
+  return label.length >= width ? label : label.padEnd(width);
+}
+function statusColor(value, warnAt = 0.7, dangerAt = 0.9) {
+  if (value >= dangerAt) {
+    return source_default.red;
+  }
+  if (value >= warnAt) {
+    return source_default.yellow;
+  }
+  return source_default.green;
+}
+function availabilityColor(value, warnBelow = 0.25, dangerBelow = 0.1) {
+  if (value <= dangerBelow) {
+    return source_default.red;
+  }
+  if (value <= warnBelow) {
+    return source_default.yellow;
+  }
+  return source_default.green;
+}
+function renderGauge(value, options) {
+  const width = options?.width ?? 24;
+  const normalized = clamp(value, 0, 1);
+  const filled = Math.round(normalized * width);
+  const empty = width - filled;
+  const color = statusColor(normalized, options?.warnAt, options?.dangerAt);
+  return `${color("\u2588".repeat(filled))}${source_default.gray("\u2591".repeat(empty))}`;
+}
+function renderAvailabilityGauge(value, options) {
+  const width = options?.width ?? 24;
+  const normalized = clamp(value, 0, 1);
+  const filled = Math.round(normalized * width);
+  const empty = width - filled;
+  const color = availabilityColor(normalized, options?.warnBelow, options?.dangerBelow);
+  return `${color("\u2588".repeat(filled))}${source_default.gray("\u2591".repeat(empty))}`;
+}
+function renderNeutralGauge(value, options) {
+  const width = options?.width ?? 24;
+  const normalized = clamp(value, 0, 1);
+  const filled = Math.round(normalized * width);
+  const empty = width - filled;
+  const color = options?.color ?? source_default.cyan;
+  return `${color("\u2588".repeat(filled))}${source_default.gray("\u2591".repeat(empty))}`;
+}
+function renderUnknownGauge(width = 24) {
+  return source_default.gray("\u2591".repeat(width));
+}
+function ratioOrNull(used, total) {
+  if (used === null || total === null || total <= 0) {
+    return null;
+  }
+  return used / total;
+}
+function renderMetricLine(label, ratio, detail, options) {
+  const labelText = padLabel(label, 10);
+  const gauge = ratio === null ? renderUnknownGauge(options?.width ?? 24) : options?.availability === true ? renderAvailabilityGauge(ratio, {
+    width: options.width,
+    warnBelow: options.warnBelow,
+    dangerBelow: options.dangerBelow
+  }) : renderGauge(ratio, {
+    width: options?.width,
+    warnAt: options?.warnAt,
+    dangerAt: options?.dangerAt
+  });
+  const percent = ratio === null ? source_default.gray("--") : formatPercent(Math.max(0, ratio));
+  console.log(`  ${labelText} ${gauge} ${percent.padStart(4)}  ${detail}`);
 }
 function riskBadge(risk) {
   if (risk === "safe") {
@@ -42483,6 +42563,31 @@ function sumKnownBytes(items) {
 function countUnknownBytes(items) {
   return items.filter((item) => (item.reclaimedBytes ?? item.reclaimableBytes ?? null) === null).length;
 }
+function countByRisk(items) {
+  return {
+    safe: items.filter((item) => item.risk === "safe").length,
+    caution: items.filter((item) => item.risk === "caution").length,
+    danger: items.filter((item) => item.risk === "danger").length
+  };
+}
+function printRiskDistribution(items) {
+  const total = items.length;
+  const counts = countByRisk(items);
+  if (total === 0) {
+    return;
+  }
+  console.log(source_default.bold("\uC704\uD5D8\uB3C4 \uBD84\uD3EC"));
+  for (const risk of ["safe", "caution", "danger"]) {
+    const count2 = counts[risk];
+    const ratio = count2 / total;
+    console.log(
+      `  ${padLabel(RISK_LABELS[risk], 4)} ${renderNeutralGauge(ratio, {
+        width: 18,
+        color: RISK_COLORS[risk]
+      })} ${count2}\uAC1C`
+    );
+  }
+}
 async function scanCategories(category) {
   const categories = category ? [category] : [...CATEGORY_IDS];
   const results = [];
@@ -42510,31 +42615,36 @@ function printScanResults(results) {
   }
   console.log("");
   console.log(source_default.bold("\uC2A4\uCE94 \uACB0\uACFC"));
+  const totalKnown = sumKnownBytes(allItems);
+  const totalUnknown = countUnknownBytes(allItems);
+  console.log(
+    `${source_default.bold("\uC804\uCCB4 \uC608\uC0C1 \uD68C\uC218")} ${formatBytes(totalKnown)}${totalUnknown > 0 ? source_default.gray(` / \uD06C\uAE30 \uBBF8\uD655\uC815 ${totalUnknown}\uAC1C`) : ""}`
+  );
+  printRiskDistribution(allItems);
   for (const result of results) {
     if (result.items.length === 0) {
       continue;
     }
     const knownTotal = sumKnownBytes(result.items);
     const unknownCount = countUnknownBytes(result.items);
+    const categoryRatio = totalKnown > 0 ? knownTotal / totalKnown : 0;
     console.log("");
     console.log(
-      `${categoryBadge(result.category)} ${result.items.length}\uAC1C / \uC608\uC0C1 \uD68C\uC218 ${formatBytes(knownTotal)}${unknownCount > 0 ? source_default.gray(` / \uD06C\uAE30 \uBBF8\uD655\uC815 ${unknownCount}\uAC1C`) : ""}`
+      `${categoryBadge(result.category)} ${renderNeutralGauge(categoryRatio, {
+        width: 18,
+        color: source_default.cyan
+      })} ${result.items.length}\uAC1C / \uC608\uC0C1 \uD68C\uC218 ${formatBytes(knownTotal)}${unknownCount > 0 ? source_default.gray(` / \uD06C\uAE30 \uBBF8\uD655\uC815 ${unknownCount}\uAC1C`) : ""}`
     );
     for (const item of result.items) {
+      const itemRatio = knownTotal > 0 && item.reclaimableBytes !== null ? item.reclaimableBytes / knownTotal : 0;
+      const gauge = item.reclaimableBytes === null ? renderUnknownGauge(12) : renderNeutralGauge(itemRatio, { width: 12, color: RISK_COLORS[item.risk] });
       console.log(
-        `  ${riskBadge(item.risk)} ${sudoBadge(item)}${source_default.bold(item.label)} ${source_default.gray(
+        `  ${gauge} ${riskBadge(item.risk)} ${sudoBadge(item)}${source_default.bold(item.label)} ${source_default.gray(
           formatBytes(item.reclaimableBytes)
         )}`
       );
       console.log(`    ${source_default.gray(item.description)}`);
     }
-  }
-  const totalKnown = sumKnownBytes(allItems);
-  const totalUnknown = countUnknownBytes(allItems);
-  console.log("");
-  console.log(`${source_default.bold("\uC804\uCCB4 \uC608\uC0C1 \uD68C\uC218")}: ${formatBytes(totalKnown)}`);
-  if (totalUnknown > 0) {
-    console.log(source_default.gray(`\uD06C\uAE30 \uBBF8\uD655\uC815 \uD56D\uBAA9 ${totalUnknown}\uAC1C\uAC00 \uBCC4\uB3C4\uB85C \uC788\uC2B5\uB2C8\uB2E4.`));
   }
 }
 async function selectItems(items, force) {
@@ -42637,6 +42747,9 @@ function printExecutionSummary(records, dryRun) {
   const label = dryRun ? "\uC608\uC0C1 \uD68C\uC218" : "\uD68C\uC218";
   console.log("");
   console.log(source_default.bold(dryRun ? "Dry-run \uACB0\uACFC" : "\uC815\uB9AC \uACB0\uACFC"));
+  const allResults = records.map((record) => record.result);
+  const totalKnown = sumKnownBytes(allResults);
+  const totalUnknown = countUnknownBytes(allResults);
   for (const category of CATEGORY_IDS) {
     const categoryRecords = records.filter((record) => record.item.category === category);
     if (categoryRecords.length === 0) {
@@ -42645,13 +42758,14 @@ function printExecutionSummary(records, dryRun) {
     const knownTotal = sumKnownBytes(categoryRecords.map((record) => record.result));
     const unknownCount = countUnknownBytes(categoryRecords.map((record) => record.result));
     const failures = categoryRecords.filter((record) => !record.result.success).length;
+    const ratio = totalKnown > 0 ? knownTotal / totalKnown : 0;
     console.log(
-      `${categoryBadge(category)} ${categoryRecords.length}\uAC1C / ${label} ${formatBytes(knownTotal)}${unknownCount > 0 ? source_default.gray(` / \uD06C\uAE30 \uBBF8\uD655\uC815 ${unknownCount}\uAC1C`) : ""}${failures > 0 ? source_default.red(` / \uC2E4\uD328 ${failures}\uAC1C`) : ""}`
+      `${categoryBadge(category)} ${renderNeutralGauge(ratio, {
+        width: 18,
+        color: failures > 0 ? source_default.red : source_default.cyan
+      })} ${categoryRecords.length}\uAC1C / ${label} ${formatBytes(knownTotal)}${unknownCount > 0 ? source_default.gray(` / \uD06C\uAE30 \uBBF8\uD655\uC815 ${unknownCount}\uAC1C`) : ""}${failures > 0 ? source_default.red(` / \uC2E4\uD328 ${failures}\uAC1C`) : ""}`
     );
   }
-  const allResults = records.map((record) => record.result);
-  const totalKnown = sumKnownBytes(allResults);
-  const totalUnknown = countUnknownBytes(allResults);
   console.log(`${source_default.bold(`\uC804\uCCB4 ${label}`)}: ${formatBytes(totalKnown)}`);
   if (totalUnknown > 0) {
     console.log(source_default.gray(`\uD06C\uAE30 \uBBF8\uD655\uC815 \uD56D\uBAA9 ${totalUnknown}\uAC1C\uAC00 \uBCC4\uB3C4\uB85C \uC788\uC2B5\uB2C8\uB2E4.`));
@@ -42692,34 +42806,219 @@ async function handleClean(options) {
 function formatMaybeBytes(bytes) {
   return bytes === null ? "\uD655\uC778 \uBD88\uAC00" : prettyBytes(bytes);
 }
-async function handleDoctor() {
+function parseMemoryFreeRatio(pressure) {
+  const match = pressure?.match(/System-wide memory free percentage:\s*(\d+)%/i);
+  if (!match?.[1]) {
+    return null;
+  }
+  const percent = Number.parseInt(match[1], 10);
+  return Number.isFinite(percent) ? percent / 100 : null;
+}
+function doctorRatios(result) {
+  const diskMeasuredBytes = result.disk ? result.disk.usedBytes + result.disk.availableBytes : null;
+  const [oneMinute, fiveMinutes, fifteenMinutes] = result.cpu.loadAverage;
+  return {
+    memoryUsedRatio: ratioOrNull(result.memory.usedBytes, result.memory.totalBytes),
+    inactiveRatio: ratioOrNull(result.memory.inactiveBytes, result.memory.totalBytes),
+    memoryFreeRatio: parseMemoryFreeRatio(result.memory.pressure),
+    diskUsedRatio: result.disk ? ratioOrNull(result.disk.usedBytes, diskMeasuredBytes) : null,
+    diskAvailableRatio: result.disk ? ratioOrNull(result.disk.availableBytes, diskMeasuredBytes) : null,
+    cpuLoadRatios: [
+      oneMinute / result.cpu.cpuCount,
+      fiveMinutes / result.cpu.cpuCount,
+      fifteenMinutes / result.cpu.cpuCount
+    ]
+  };
+}
+function highRatioStatus(value, warnAt, dangerAt) {
+  if (value === null) {
+    return "normal";
+  }
+  if (value >= dangerAt) {
+    return "danger";
+  }
+  if (value >= warnAt) {
+    return "caution";
+  }
+  return "normal";
+}
+function lowRatioStatus(value, warnBelow, dangerBelow) {
+  if (value === null) {
+    return "normal";
+  }
+  if (value <= dangerBelow) {
+    return "danger";
+  }
+  if (value <= warnBelow) {
+    return "caution";
+  }
+  return "normal";
+}
+function worstDoctorStatus(statuses) {
+  if (statuses.includes("danger")) {
+    return "danger";
+  }
+  if (statuses.includes("caution")) {
+    return "caution";
+  }
+  return "normal";
+}
+function doctorStatus(result, ratios) {
+  return worstDoctorStatus([
+    highRatioStatus(ratios.memoryUsedRatio, 0.75, 0.9),
+    lowRatioStatus(ratios.memoryFreeRatio, 0.25, 0.1),
+    highRatioStatus(ratios.diskUsedRatio, 0.75, 0.9),
+    lowRatioStatus(ratios.diskAvailableRatio, 0.2, 0.1),
+    highRatioStatus(ratios.cpuLoadRatios[0], 0.7, 1),
+    highRatioStatus(ratios.cpuLoadRatios[1], 0.7, 1),
+    result.disk === null ? "caution" : "normal"
+  ]);
+}
+function doctorStatusBadge(status) {
+  if (status === "danger") {
+    return source_default.red("\uC704\uD5D8");
+  }
+  if (status === "caution") {
+    return source_default.yellow("\uC8FC\uC758");
+  }
+  return source_default.green("\uC815\uC0C1");
+}
+function renderDoctorResult(result, options) {
+  const ratios = doctorRatios(result);
+  const status = doctorStatus(result, ratios);
+  const scannedAt = result.scannedAt.toLocaleString("ko-KR");
+  console.log(source_default.bold("\uC2DC\uC2A4\uD15C \uC9C4\uB2E8"));
+  console.log(
+    `${source_default.bold("\uC0C1\uD0DC")} ${doctorStatusBadge(status)} ${source_default.gray(`/ \uAC31\uC2E0 ${scannedAt}`)}${options.watch && options.intervalSeconds ? source_default.gray(` / ${options.intervalSeconds}\uCD08 \uAC04\uACA9 / Ctrl+C \uC885\uB8CC`) : ""}${options.watch && options.iteration ? source_default.gray(` / ${options.iteration}\uD68C\uCC28`) : ""}`
+  );
+  console.log("");
+  console.log(`${source_default.cyan("[\uBA54\uBAA8\uB9AC]")} \uC804\uCCB4 ${formatMaybeBytes(result.memory.totalBytes)}`);
+  renderMetricLine(
+    "\uC0AC\uC6A9\uB960",
+    ratios.memoryUsedRatio,
+    `${formatMaybeBytes(result.memory.usedBytes)} \uC0AC\uC6A9 \uCD94\uC815`,
+    { warnAt: 0.75, dangerAt: 0.9 }
+  );
+  renderMetricLine(
+    "\uBE44\uD65C\uC131",
+    ratios.inactiveRatio,
+    `${formatMaybeBytes(result.memory.inactiveBytes)} purge \uD6C4\uBCF4`,
+    { warnAt: 0.5, dangerAt: 0.75 }
+  );
+  renderMetricLine(
+    "\uC5EC\uC720\uC728",
+    ratios.memoryFreeRatio,
+    "memory_pressure \uAE30\uC900",
+    { availability: true, warnBelow: 0.25, dangerBelow: 0.1 }
+  );
+  console.log(
+    `  ${source_default.gray("\uC138\uBD80")} active ${formatMaybeBytes(result.memory.activeBytes)} / wired ${formatMaybeBytes(
+      result.memory.wiredBytes
+    )} / compressed ${formatMaybeBytes(result.memory.compressedBytes)}`
+  );
+  if (result.disk) {
+    console.log(`${source_default.cyan("[\uB514\uC2A4\uD06C]")} /`);
+    renderMetricLine(
+      "\uC0AC\uC6A9\uB960",
+      ratios.diskUsedRatio,
+      `${prettyBytes(result.disk.usedBytes)} \uC0AC\uC6A9 / ${prettyBytes(result.disk.availableBytes)} \uC5EC\uC720 (${result.disk.capacity})`,
+      { warnAt: 0.75, dangerAt: 0.9 }
+    );
+    renderMetricLine(
+      "\uC5EC\uC720\uC728",
+      ratios.diskAvailableRatio,
+      `${prettyBytes(result.disk.availableBytes)} \uC5EC\uC720`,
+      { availability: true, warnBelow: 0.2, dangerBelow: 0.1 }
+    );
+  } else {
+    console.log(`${source_default.cyan("[\uB514\uC2A4\uD06C]")} \uD655\uC778 \uBD88\uAC00`);
+  }
+  console.log(`${source_default.cyan("[CPU]")} \uCF54\uC5B4 ${result.cpu.cpuCount}\uAC1C`);
+  renderMetricLine(
+    "1\uBD84",
+    ratios.cpuLoadRatios[0],
+    `loadavg ${result.cpu.loadAverage[0].toFixed(2)}`,
+    { warnAt: 0.7, dangerAt: 1 }
+  );
+  renderMetricLine(
+    "5\uBD84",
+    ratios.cpuLoadRatios[1],
+    `loadavg ${result.cpu.loadAverage[1].toFixed(2)}`,
+    { warnAt: 0.7, dangerAt: 1 }
+  );
+  renderMetricLine(
+    "15\uBD84",
+    ratios.cpuLoadRatios[2],
+    `loadavg ${result.cpu.loadAverage[2].toFixed(2)}`,
+    { warnAt: 0.7, dangerAt: 1 }
+  );
+}
+function parseDoctorIntervalSeconds(value) {
+  if (value === void 0) {
+    return 5;
+  }
+  const interval = Number.parseFloat(value);
+  if (!Number.isFinite(interval) || interval < 1) {
+    throw new Error(`doctor \uAC31\uC2E0 \uAC04\uACA9\uC740 1\uCD08 \uC774\uC0C1\uC758 \uC22B\uC790\uC5EC\uC57C \uD569\uB2C8\uB2E4: ${value}`);
+  }
+  return interval;
+}
+function clearTerminalScreen() {
+  process.stdout.write("\x1B[2J\x1B[H");
+}
+async function watchDoctor(intervalSeconds) {
+  let running = true;
+  let iteration = 0;
+  const abortController = new AbortController();
+  const stop = () => {
+    running = false;
+    abortController.abort();
+  };
+  process.once("SIGINT", stop);
+  process.stdout.write("\x1B[?25l");
+  try {
+    while (running) {
+      iteration += 1;
+      clearTerminalScreen();
+      try {
+        const result = await diagnose();
+        renderDoctorResult(result, {
+          watch: true,
+          intervalSeconds,
+          iteration
+        });
+      } catch (error) {
+        console.error(source_default.red(`\uC2DC\uC2A4\uD15C \uC0C1\uD0DC \uC9C4\uB2E8 \uC2E4\uD328: ${error instanceof Error ? error.message : String(error)}`));
+      }
+      if (!running) {
+        break;
+      }
+      try {
+        await sleep(intervalSeconds * 1e3, void 0, { signal: abortController.signal });
+      } catch {
+        break;
+      }
+    }
+  } finally {
+    process.stdout.write("\x1B[?25h");
+    process.off("SIGINT", stop);
+    console.log("");
+    console.log(source_default.gray("doctor watch \uBAA8\uB4DC\uB97C \uC885\uB8CC\uD588\uC2B5\uB2C8\uB2E4."));
+  }
+}
+async function handleDoctor(options) {
+  const intervalSeconds = parseDoctorIntervalSeconds(options.interval);
+  const watch = options.watch === true || options.interval !== void 0;
+  if (watch) {
+    await watchDoctor(intervalSeconds);
+    return;
+  }
   const spinner = ora2("\uC2DC\uC2A4\uD15C \uC0C1\uD0DC \uC9C4\uB2E8 \uC911...").start();
   try {
     const result = await diagnose();
     spinner.succeed("\uC2DC\uC2A4\uD15C \uC0C1\uD0DC \uC9C4\uB2E8 \uC644\uB8CC");
-    const pressureMatch = result.memory.pressure?.match(/System-wide memory free percentage:\s*([^\n]+)/i);
-    const pressure = pressureMatch?.[1]?.trim() ?? "\uD655\uC778 \uBD88\uAC00";
     console.log("");
-    console.log(source_default.bold("\uC2DC\uC2A4\uD15C \uC9C4\uB2E8"));
-    console.log(`${source_default.cyan("[\uBA54\uBAA8\uB9AC]")} \uC804\uCCB4 ${formatMaybeBytes(result.memory.totalBytes)}`);
-    console.log(`  \uC0AC\uC6A9 \uCD94\uC815: ${formatMaybeBytes(result.memory.usedBytes)}`);
-    console.log(`  active: ${formatMaybeBytes(result.memory.activeBytes)}`);
-    console.log(`  wired: ${formatMaybeBytes(result.memory.wiredBytes)}`);
-    console.log(`  compressed: ${formatMaybeBytes(result.memory.compressedBytes)}`);
-    console.log(`  inactive: ${formatMaybeBytes(result.memory.inactiveBytes)}`);
-    console.log(`  memory_pressure: ${pressure}`);
-    if (result.disk) {
-      console.log(`${source_default.cyan("[\uB514\uC2A4\uD06C]")} / \uC0AC\uC6A9\uB960 ${result.disk.capacity}`);
-      console.log(`  \uC804\uCCB4: ${prettyBytes(result.disk.totalBytes)}`);
-      console.log(`  \uC0AC\uC6A9: ${prettyBytes(result.disk.usedBytes)}`);
-      console.log(`  \uC5EC\uC720: ${prettyBytes(result.disk.availableBytes)}`);
-    } else {
-      console.log(`${source_default.cyan("[\uB514\uC2A4\uD06C]")} \uD655\uC778 \uBD88\uAC00`);
-    }
-    console.log(`${source_default.cyan("[CPU]")} \uCF54\uC5B4 ${result.cpu.cpuCount}\uAC1C`);
-    console.log(
-      `  loadavg: ${result.cpu.loadAverage.map((value) => value.toFixed(2)).join(", ")}`
-    );
+    renderDoctorResult(result, { watch: false });
   } catch (error) {
     spinner.fail("\uC2DC\uC2A4\uD15C \uC0C1\uD0DC \uC9C4\uB2E8 \uC2E4\uD328");
     throw error;
@@ -42763,7 +43062,7 @@ async function main2() {
   }).version("0.1.0", "-V, --version", "\uBC84\uC804\uC744 \uD45C\uC2DC\uD569\uB2C8\uB2E4.");
   program2.command("scan").description("\uC815\uB9AC \uAC00\uB2A5 \uB9AC\uC18C\uC2A4\uB97C \uC2A4\uCE94\uD569\uB2C8\uB2E4. \uC2E4\uC81C \uC815\uB9AC\uB294 \uC218\uD589\uD558\uC9C0 \uC54A\uC2B5\uB2C8\uB2E4.").option("--category <\uCE74\uD14C\uACE0\uB9AC>", `\uCE74\uD14C\uACE0\uB9AC \uC120\uD0DD (${CATEGORY_IDS.join(", ")})`).action((options) => handleScan(options));
   program2.command("clean").description("\uC778\uD130\uB799\uD2F0\uBE0C\uD558\uAC8C \uB9AC\uC18C\uC2A4\uB97C \uC815\uB9AC\uD569\uB2C8\uB2E4.").option("--category <\uCE74\uD14C\uACE0\uB9AC>", `\uCE74\uD14C\uACE0\uB9AC \uC120\uD0DD (${CATEGORY_IDS.join(", ")})`).option("--dry-run", "\uC2DC\uBBAC\uB808\uC774\uC158\uB9CC \uC218\uD589\uD569\uB2C8\uB2E4.").option("--force", "\uC548\uC804 \uD56D\uBAA9\uC744 \uD655\uC778 \uC5C6\uC774 \uC790\uB3D9 \uC815\uB9AC\uD569\uB2C8\uB2E4.").action((options) => handleClean(options));
-  program2.command("doctor").description("\uBA54\uBAA8\uB9AC, \uB514\uC2A4\uD06C, CPU \uC0C1\uD0DC\uB97C \uC9C4\uB2E8\uD569\uB2C8\uB2E4.").action(() => handleDoctor());
+  program2.command("doctor").description("\uBA54\uBAA8\uB9AC, \uB514\uC2A4\uD06C, CPU \uC0C1\uD0DC\uB97C \uC9C4\uB2E8\uD569\uB2C8\uB2E4.").option("--watch", "\uC77C\uC815 \uAC04\uACA9\uC73C\uB85C \uC0C1\uD0DC\uB97C \uAC31\uC2E0\uD569\uB2C8\uB2E4.").option("--interval <\uCD08>", "watch \uBAA8\uB4DC \uAC31\uC2E0 \uAC04\uACA9\uC785\uB2C8\uB2E4. \uAE30\uBCF8\uAC12\uC740 5\uCD08\uC785\uB2C8\uB2E4.").action((options) => handleDoctor(options));
   program2.command("history").description("\uC815\uB9AC \uC774\uB825\uC744 \uC870\uD68C\uD569\uB2C8\uB2E4.").option("--limit <\uAC1C\uC218>", "\uC870\uD68C\uD560 \uCD5C\uADFC \uC774\uB825 \uAC1C\uC218", "20").action((options) => handleHistory(options));
   await program2.parseAsync(process.argv);
 }

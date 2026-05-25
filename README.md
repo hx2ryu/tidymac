@@ -22,11 +22,19 @@ node dist/cli.js --help
 ```bash
 tidymac scan [--category <cat>]
 tidymac clean [--category <cat>] [--dry-run] [--force]
-tidymac doctor
+tidymac doctor [--watch] [--interval <초>]
 tidymac history [--limit <n>]
 ```
 
 카테고리는 `memory`, `disk`, `cpu`, `network`를 지원합니다.
+
+`doctor --watch`는 터미널 한쪽에 띄워두고 시스템 상태를 주기적으로 갱신할 때 사용합니다.
+
+```bash
+tidymac doctor --watch
+tidymac doctor --watch --interval 10
+tidymac doctor --interval 3
+```
 
 ## 안전 모델
 

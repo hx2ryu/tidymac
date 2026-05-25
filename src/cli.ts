@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import { randomUUID } from "node:crypto";
 import { platform } from "node:os";
-import chalk from "chalk";
+import { setTimeout as sleep } from "node:timers/promises";
+import chalk, { type ChalkInstance } from "chalk";
 import { Command, type Help } from "commander";
 import inquirer from "inquirer";
 import ora from "ora";
@@ -18,7 +19,8 @@ import type {
   ExecuteResult,
   HistoryEntry,
   RiskLevel,
-  ScanResult
+  ScanResult,
+  DoctorDiagnosis
 } from "./lib/types.js";
 
 const CATEGORY_IDS = ["memory", "disk", "cpu", "network"] as const satisfies readonly CategoryId[];
@@ -34,6 +36,12 @@ const RISK_LABELS: Record<RiskLevel, string> = {
   safe: "안전",
   caution: "주의",
   danger: "위험"
+};
+
+const RISK_COLORS: Record<RiskLevel, ChalkInstance> = {
+  safe: chalk.green,
+  caution: chalk.yellow,
+  danger: chalk.red
 };
 
 const SCANNERS: Record<CategoryId, () => Promise<ScanResult>> = {
@@ -55,6 +63,11 @@ interface ScanOptions {
 
 interface HistoryOptions {
   limit?: string;
+}
+
+interface DoctorOptions {
+  watch?: boolean;
+  interval?: string;
 }
 
 interface ExecutionRecord {
@@ -83,6 +96,116 @@ function parseCategory(category: string | undefined): CategoryId | undefined {
 
 function formatBytes(bytes: number | null): string {
   return bytes === null ? chalk.gray("크기 미확정") : prettyBytes(bytes);
+}
+
+function formatPercent(value: number): string {
+  return `${Math.round(value * 100)}%`;
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+function padLabel(label: string, width: number): string {
+  return label.length >= width ? label : label.padEnd(width);
+}
+
+function statusColor(value: number, warnAt = 0.7, dangerAt = 0.9): ChalkInstance {
+  if (value >= dangerAt) {
+    return chalk.red;
+  }
+
+  if (value >= warnAt) {
+    return chalk.yellow;
+  }
+
+  return chalk.green;
+}
+
+function availabilityColor(value: number, warnBelow = 0.25, dangerBelow = 0.1): ChalkInstance {
+  if (value <= dangerBelow) {
+    return chalk.red;
+  }
+
+  if (value <= warnBelow) {
+    return chalk.yellow;
+  }
+
+  return chalk.green;
+}
+
+function renderGauge(value: number, options?: { width?: number; warnAt?: number; dangerAt?: number }): string {
+  const width = options?.width ?? 24;
+  const normalized = clamp(value, 0, 1);
+  const filled = Math.round(normalized * width);
+  const empty = width - filled;
+  const color = statusColor(normalized, options?.warnAt, options?.dangerAt);
+  return `${color("█".repeat(filled))}${chalk.gray("░".repeat(empty))}`;
+}
+
+function renderAvailabilityGauge(
+  value: number,
+  options?: { width?: number; warnBelow?: number; dangerBelow?: number }
+): string {
+  const width = options?.width ?? 24;
+  const normalized = clamp(value, 0, 1);
+  const filled = Math.round(normalized * width);
+  const empty = width - filled;
+  const color = availabilityColor(normalized, options?.warnBelow, options?.dangerBelow);
+  return `${color("█".repeat(filled))}${chalk.gray("░".repeat(empty))}`;
+}
+
+function renderNeutralGauge(value: number, options?: { width?: number; color?: ChalkInstance }): string {
+  const width = options?.width ?? 24;
+  const normalized = clamp(value, 0, 1);
+  const filled = Math.round(normalized * width);
+  const empty = width - filled;
+  const color = options?.color ?? chalk.cyan;
+  return `${color("█".repeat(filled))}${chalk.gray("░".repeat(empty))}`;
+}
+
+function renderUnknownGauge(width = 24): string {
+  return chalk.gray("░".repeat(width));
+}
+
+function ratioOrNull(used: number | null, total: number | null): number | null {
+  if (used === null || total === null || total <= 0) {
+    return null;
+  }
+
+  return used / total;
+}
+
+function renderMetricLine(
+  label: string,
+  ratio: number | null,
+  detail: string,
+  options?: {
+    width?: number;
+    availability?: boolean;
+    warnAt?: number;
+    dangerAt?: number;
+    warnBelow?: number;
+    dangerBelow?: number;
+  }
+): void {
+  const labelText = padLabel(label, 10);
+  const gauge =
+    ratio === null
+      ? renderUnknownGauge(options?.width ?? 24)
+      : options?.availability === true
+        ? renderAvailabilityGauge(ratio, {
+            width: options.width,
+            warnBelow: options.warnBelow,
+            dangerBelow: options.dangerBelow
+          })
+        : renderGauge(ratio, {
+            width: options?.width,
+            warnAt: options?.warnAt,
+            dangerAt: options?.dangerAt
+          });
+  const percent = ratio === null ? chalk.gray("--") : formatPercent(Math.max(0, ratio));
+  console.log(`  ${labelText} ${gauge} ${percent.padStart(4)}  ${detail}`);
 }
 
 function riskBadge(risk: RiskLevel): string {
@@ -168,6 +291,35 @@ function countUnknownBytes(items: Array<{ reclaimedBytes?: number | null; reclai
   return items.filter((item) => (item.reclaimedBytes ?? item.reclaimableBytes ?? null) === null).length;
 }
 
+function countByRisk(items: CleanableItem[]): Record<RiskLevel, number> {
+  return {
+    safe: items.filter((item) => item.risk === "safe").length,
+    caution: items.filter((item) => item.risk === "caution").length,
+    danger: items.filter((item) => item.risk === "danger").length
+  };
+}
+
+function printRiskDistribution(items: CleanableItem[]): void {
+  const total = items.length;
+  const counts = countByRisk(items);
+
+  if (total === 0) {
+    return;
+  }
+
+  console.log(chalk.bold("위험도 분포"));
+  for (const risk of ["safe", "caution", "danger"] as const) {
+    const count = counts[risk];
+    const ratio = count / total;
+    console.log(
+      `  ${padLabel(RISK_LABELS[risk], 4)} ${renderNeutralGauge(ratio, {
+        width: 18,
+        color: RISK_COLORS[risk]
+      })} ${count}개`
+    );
+  }
+}
+
 async function scanCategories(category?: CategoryId): Promise<ScanResult[]> {
   const categories = category ? [category] : [...CATEGORY_IDS];
   const results: ScanResult[] = [];
@@ -200,6 +352,15 @@ function printScanResults(results: ScanResult[]): void {
 
   console.log("");
   console.log(chalk.bold("스캔 결과"));
+  const totalKnown = sumKnownBytes(allItems);
+  const totalUnknown = countUnknownBytes(allItems);
+
+  console.log(
+    `${chalk.bold("전체 예상 회수")} ${formatBytes(totalKnown)}${
+      totalUnknown > 0 ? chalk.gray(` / 크기 미확정 ${totalUnknown}개`) : ""
+    }`
+  );
+  printRiskDistribution(allItems);
 
   for (const result of results) {
     if (result.items.length === 0) {
@@ -208,29 +369,30 @@ function printScanResults(results: ScanResult[]): void {
 
     const knownTotal = sumKnownBytes(result.items);
     const unknownCount = countUnknownBytes(result.items);
+    const categoryRatio = totalKnown > 0 ? knownTotal / totalKnown : 0;
     console.log("");
     console.log(
-      `${categoryBadge(result.category)} ${result.items.length}개 / 예상 회수 ${formatBytes(knownTotal)}${
+      `${categoryBadge(result.category)} ${renderNeutralGauge(categoryRatio, {
+        width: 18,
+        color: chalk.cyan
+      })} ${result.items.length}개 / 예상 회수 ${formatBytes(knownTotal)}${
         unknownCount > 0 ? chalk.gray(` / 크기 미확정 ${unknownCount}개`) : ""
       }`
     );
 
     for (const item of result.items) {
+      const itemRatio = knownTotal > 0 && item.reclaimableBytes !== null ? item.reclaimableBytes / knownTotal : 0;
+      const gauge =
+        item.reclaimableBytes === null
+          ? renderUnknownGauge(12)
+          : renderNeutralGauge(itemRatio, { width: 12, color: RISK_COLORS[item.risk] });
       console.log(
-        `  ${riskBadge(item.risk)} ${sudoBadge(item)}${chalk.bold(item.label)} ${chalk.gray(
+        `  ${gauge} ${riskBadge(item.risk)} ${sudoBadge(item)}${chalk.bold(item.label)} ${chalk.gray(
           formatBytes(item.reclaimableBytes)
         )}`
       );
       console.log(`    ${chalk.gray(item.description)}`);
     }
-  }
-
-  const totalKnown = sumKnownBytes(allItems);
-  const totalUnknown = countUnknownBytes(allItems);
-  console.log("");
-  console.log(`${chalk.bold("전체 예상 회수")}: ${formatBytes(totalKnown)}`);
-  if (totalUnknown > 0) {
-    console.log(chalk.gray(`크기 미확정 항목 ${totalUnknown}개가 별도로 있습니다.`));
   }
 }
 
@@ -352,6 +514,9 @@ function printExecutionSummary(records: ExecutionRecord[], dryRun: boolean): voi
   const label = dryRun ? "예상 회수" : "회수";
   console.log("");
   console.log(chalk.bold(dryRun ? "Dry-run 결과" : "정리 결과"));
+  const allResults = records.map((record) => record.result);
+  const totalKnown = sumKnownBytes(allResults);
+  const totalUnknown = countUnknownBytes(allResults);
 
   for (const category of CATEGORY_IDS) {
     const categoryRecords = records.filter((record) => record.item.category === category);
@@ -362,17 +527,18 @@ function printExecutionSummary(records: ExecutionRecord[], dryRun: boolean): voi
     const knownTotal = sumKnownBytes(categoryRecords.map((record) => record.result));
     const unknownCount = countUnknownBytes(categoryRecords.map((record) => record.result));
     const failures = categoryRecords.filter((record) => !record.result.success).length;
+    const ratio = totalKnown > 0 ? knownTotal / totalKnown : 0;
 
     console.log(
-      `${categoryBadge(category)} ${categoryRecords.length}개 / ${label} ${formatBytes(knownTotal)}${
+      `${categoryBadge(category)} ${renderNeutralGauge(ratio, {
+        width: 18,
+        color: failures > 0 ? chalk.red : chalk.cyan
+      })} ${categoryRecords.length}개 / ${label} ${formatBytes(knownTotal)}${
         unknownCount > 0 ? chalk.gray(` / 크기 미확정 ${unknownCount}개`) : ""
       }${failures > 0 ? chalk.red(` / 실패 ${failures}개`) : ""}`
     );
   }
 
-  const allResults = records.map((record) => record.result);
-  const totalKnown = sumKnownBytes(allResults);
-  const totalUnknown = countUnknownBytes(allResults);
   console.log(`${chalk.bold(`전체 ${label}`)}: ${formatBytes(totalKnown)}`);
   if (totalUnknown > 0) {
     console.log(chalk.gray(`크기 미확정 항목 ${totalUnknown}개가 별도로 있습니다.`));
@@ -423,38 +589,278 @@ function formatMaybeBytes(bytes: number | null): string {
   return bytes === null ? "확인 불가" : prettyBytes(bytes);
 }
 
-async function handleDoctor(): Promise<void> {
+function parseMemoryFreeRatio(pressure: string | null): number | null {
+  const match = pressure?.match(/System-wide memory free percentage:\s*(\d+)%/i);
+  if (!match?.[1]) {
+    return null;
+  }
+
+  const percent = Number.parseInt(match[1], 10);
+  return Number.isFinite(percent) ? percent / 100 : null;
+}
+
+type DoctorStatus = "normal" | "caution" | "danger";
+
+interface DoctorRatios {
+  memoryUsedRatio: number | null;
+  inactiveRatio: number | null;
+  memoryFreeRatio: number | null;
+  diskUsedRatio: number | null;
+  diskAvailableRatio: number | null;
+  cpuLoadRatios: [number, number, number];
+}
+
+interface DoctorRenderOptions {
+  watch: boolean;
+  intervalSeconds?: number;
+  iteration?: number;
+}
+
+function doctorRatios(result: DoctorDiagnosis): DoctorRatios {
+  const diskMeasuredBytes = result.disk ? result.disk.usedBytes + result.disk.availableBytes : null;
+  const [oneMinute, fiveMinutes, fifteenMinutes] = result.cpu.loadAverage;
+
+  return {
+    memoryUsedRatio: ratioOrNull(result.memory.usedBytes, result.memory.totalBytes),
+    inactiveRatio: ratioOrNull(result.memory.inactiveBytes, result.memory.totalBytes),
+    memoryFreeRatio: parseMemoryFreeRatio(result.memory.pressure),
+    diskUsedRatio: result.disk ? ratioOrNull(result.disk.usedBytes, diskMeasuredBytes) : null,
+    diskAvailableRatio: result.disk ? ratioOrNull(result.disk.availableBytes, diskMeasuredBytes) : null,
+    cpuLoadRatios: [
+      oneMinute / result.cpu.cpuCount,
+      fiveMinutes / result.cpu.cpuCount,
+      fifteenMinutes / result.cpu.cpuCount
+    ]
+  };
+}
+
+function highRatioStatus(value: number | null, warnAt: number, dangerAt: number): DoctorStatus {
+  if (value === null) {
+    return "normal";
+  }
+
+  if (value >= dangerAt) {
+    return "danger";
+  }
+
+  if (value >= warnAt) {
+    return "caution";
+  }
+
+  return "normal";
+}
+
+function lowRatioStatus(value: number | null, warnBelow: number, dangerBelow: number): DoctorStatus {
+  if (value === null) {
+    return "normal";
+  }
+
+  if (value <= dangerBelow) {
+    return "danger";
+  }
+
+  if (value <= warnBelow) {
+    return "caution";
+  }
+
+  return "normal";
+}
+
+function worstDoctorStatus(statuses: DoctorStatus[]): DoctorStatus {
+  if (statuses.includes("danger")) {
+    return "danger";
+  }
+
+  if (statuses.includes("caution")) {
+    return "caution";
+  }
+
+  return "normal";
+}
+
+function doctorStatus(result: DoctorDiagnosis, ratios: DoctorRatios): DoctorStatus {
+  return worstDoctorStatus([
+    highRatioStatus(ratios.memoryUsedRatio, 0.75, 0.9),
+    lowRatioStatus(ratios.memoryFreeRatio, 0.25, 0.1),
+    highRatioStatus(ratios.diskUsedRatio, 0.75, 0.9),
+    lowRatioStatus(ratios.diskAvailableRatio, 0.2, 0.1),
+    highRatioStatus(ratios.cpuLoadRatios[0], 0.7, 1),
+    highRatioStatus(ratios.cpuLoadRatios[1], 0.7, 1),
+    result.disk === null ? "caution" : "normal"
+  ]);
+}
+
+function doctorStatusBadge(status: DoctorStatus): string {
+  if (status === "danger") {
+    return chalk.red("위험");
+  }
+
+  if (status === "caution") {
+    return chalk.yellow("주의");
+  }
+
+  return chalk.green("정상");
+}
+
+function renderDoctorResult(result: DoctorDiagnosis, options: DoctorRenderOptions): void {
+  const ratios = doctorRatios(result);
+  const status = doctorStatus(result, ratios);
+  const scannedAt = result.scannedAt.toLocaleString("ko-KR");
+
+  console.log(chalk.bold("시스템 진단"));
+  console.log(
+    `${chalk.bold("상태")} ${doctorStatusBadge(status)} ${chalk.gray(`/ 갱신 ${scannedAt}`)}${
+      options.watch && options.intervalSeconds
+        ? chalk.gray(` / ${options.intervalSeconds}초 간격 / Ctrl+C 종료`)
+        : ""
+    }${options.watch && options.iteration ? chalk.gray(` / ${options.iteration}회차`) : ""}`
+  );
+  console.log("");
+
+  console.log(`${chalk.cyan("[메모리]")} 전체 ${formatMaybeBytes(result.memory.totalBytes)}`);
+  renderMetricLine(
+    "사용률",
+    ratios.memoryUsedRatio,
+    `${formatMaybeBytes(result.memory.usedBytes)} 사용 추정`,
+    { warnAt: 0.75, dangerAt: 0.9 }
+  );
+  renderMetricLine(
+    "비활성",
+    ratios.inactiveRatio,
+    `${formatMaybeBytes(result.memory.inactiveBytes)} purge 후보`,
+    { warnAt: 0.5, dangerAt: 0.75 }
+  );
+  renderMetricLine(
+    "여유율",
+    ratios.memoryFreeRatio,
+    "memory_pressure 기준",
+    { availability: true, warnBelow: 0.25, dangerBelow: 0.1 }
+  );
+  console.log(
+    `  ${chalk.gray("세부")} active ${formatMaybeBytes(result.memory.activeBytes)} / wired ${formatMaybeBytes(
+      result.memory.wiredBytes
+    )} / compressed ${formatMaybeBytes(result.memory.compressedBytes)}`
+  );
+
+  if (result.disk) {
+    console.log(`${chalk.cyan("[디스크]")} /`);
+    renderMetricLine(
+      "사용률",
+      ratios.diskUsedRatio,
+      `${prettyBytes(result.disk.usedBytes)} 사용 / ${prettyBytes(result.disk.availableBytes)} 여유 (${result.disk.capacity})`,
+      { warnAt: 0.75, dangerAt: 0.9 }
+    );
+    renderMetricLine(
+      "여유율",
+      ratios.diskAvailableRatio,
+      `${prettyBytes(result.disk.availableBytes)} 여유`,
+      { availability: true, warnBelow: 0.2, dangerBelow: 0.1 }
+    );
+  } else {
+    console.log(`${chalk.cyan("[디스크]")} 확인 불가`);
+  }
+
+  console.log(`${chalk.cyan("[CPU]")} 코어 ${result.cpu.cpuCount}개`);
+  renderMetricLine(
+    "1분",
+    ratios.cpuLoadRatios[0],
+    `loadavg ${result.cpu.loadAverage[0].toFixed(2)}`,
+    { warnAt: 0.7, dangerAt: 1 }
+  );
+  renderMetricLine(
+    "5분",
+    ratios.cpuLoadRatios[1],
+    `loadavg ${result.cpu.loadAverage[1].toFixed(2)}`,
+    { warnAt: 0.7, dangerAt: 1 }
+  );
+  renderMetricLine(
+    "15분",
+    ratios.cpuLoadRatios[2],
+    `loadavg ${result.cpu.loadAverage[2].toFixed(2)}`,
+    { warnAt: 0.7, dangerAt: 1 }
+  );
+}
+
+function parseDoctorIntervalSeconds(value: string | undefined): number {
+  if (value === undefined) {
+    return 5;
+  }
+
+  const interval = Number.parseFloat(value);
+  if (!Number.isFinite(interval) || interval < 1) {
+    throw new Error(`doctor 갱신 간격은 1초 이상의 숫자여야 합니다: ${value}`);
+  }
+
+  return interval;
+}
+
+function clearTerminalScreen(): void {
+  process.stdout.write("\x1B[2J\x1B[H");
+}
+
+async function watchDoctor(intervalSeconds: number): Promise<void> {
+  let running = true;
+  let iteration = 0;
+  const abortController = new AbortController();
+
+  const stop = (): void => {
+    running = false;
+    abortController.abort();
+  };
+
+  process.once("SIGINT", stop);
+  process.stdout.write("\x1B[?25l");
+
+  try {
+    while (running) {
+      iteration += 1;
+      clearTerminalScreen();
+
+      try {
+        const result = await diagnose();
+        renderDoctorResult(result, {
+          watch: true,
+          intervalSeconds,
+          iteration
+        });
+      } catch (error) {
+        console.error(chalk.red(`시스템 상태 진단 실패: ${error instanceof Error ? error.message : String(error)}`));
+      }
+
+      if (!running) {
+        break;
+      }
+
+      try {
+        await sleep(intervalSeconds * 1000, undefined, { signal: abortController.signal });
+      } catch {
+        break;
+      }
+    }
+  } finally {
+    process.stdout.write("\x1B[?25h");
+    process.off("SIGINT", stop);
+    console.log("");
+    console.log(chalk.gray("doctor watch 모드를 종료했습니다."));
+  }
+}
+
+async function handleDoctor(options: DoctorOptions): Promise<void> {
+  const intervalSeconds = parseDoctorIntervalSeconds(options.interval);
+  const watch = options.watch === true || options.interval !== undefined;
+
+  if (watch) {
+    await watchDoctor(intervalSeconds);
+    return;
+  }
+
   const spinner = ora("시스템 상태 진단 중...").start();
   try {
     const result = await diagnose();
     spinner.succeed("시스템 상태 진단 완료");
 
-    const pressureMatch = result.memory.pressure?.match(/System-wide memory free percentage:\s*([^\n]+)/i);
-    const pressure = pressureMatch?.[1]?.trim() ?? "확인 불가";
-
     console.log("");
-    console.log(chalk.bold("시스템 진단"));
-    console.log(`${chalk.cyan("[메모리]")} 전체 ${formatMaybeBytes(result.memory.totalBytes)}`);
-    console.log(`  사용 추정: ${formatMaybeBytes(result.memory.usedBytes)}`);
-    console.log(`  active: ${formatMaybeBytes(result.memory.activeBytes)}`);
-    console.log(`  wired: ${formatMaybeBytes(result.memory.wiredBytes)}`);
-    console.log(`  compressed: ${formatMaybeBytes(result.memory.compressedBytes)}`);
-    console.log(`  inactive: ${formatMaybeBytes(result.memory.inactiveBytes)}`);
-    console.log(`  memory_pressure: ${pressure}`);
-
-    if (result.disk) {
-      console.log(`${chalk.cyan("[디스크]")} / 사용률 ${result.disk.capacity}`);
-      console.log(`  전체: ${prettyBytes(result.disk.totalBytes)}`);
-      console.log(`  사용: ${prettyBytes(result.disk.usedBytes)}`);
-      console.log(`  여유: ${prettyBytes(result.disk.availableBytes)}`);
-    } else {
-      console.log(`${chalk.cyan("[디스크]")} 확인 불가`);
-    }
-
-    console.log(`${chalk.cyan("[CPU]")} 코어 ${result.cpu.cpuCount}개`);
-    console.log(
-      `  loadavg: ${result.cpu.loadAverage.map((value) => value.toFixed(2)).join(", ")}`
-    );
+    renderDoctorResult(result, { watch: false });
   } catch (error) {
     spinner.fail("시스템 상태 진단 실패");
     throw error;
@@ -531,7 +937,9 @@ async function main(): Promise<void> {
   program
     .command("doctor")
     .description("메모리, 디스크, CPU 상태를 진단합니다.")
-    .action(() => handleDoctor());
+    .option("--watch", "일정 간격으로 상태를 갱신합니다.")
+    .option("--interval <초>", "watch 모드 갱신 간격입니다. 기본값은 5초입니다.")
+    .action((options: DoctorOptions) => handleDoctor(options));
 
   program
     .command("history")
