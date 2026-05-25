@@ -42407,6 +42407,8 @@ var SCANNERS = {
   cpu: scanCpu,
   network: scanNetwork
 };
+var PANEL_MAX_WIDTH = 108;
+var PANEL_MIN_WIDTH = 72;
 function ensureDarwin() {
   if (platform2() !== "darwin") {
     console.error(source_default.red("tidymac\uC740 macOS\uC5D0\uC11C\uB9CC \uC2E4\uD589\uD560 \uC218 \uC788\uC2B5\uB2C8\uB2E4."));
@@ -42431,8 +42433,46 @@ function formatPercent(value) {
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
 }
-function padLabel(label, width) {
-  return label.length >= width ? label : label.padEnd(width);
+function terminalWidth() {
+  const columns = process.stdout.columns ?? 96;
+  return Math.round(clamp(columns, PANEL_MIN_WIDTH, PANEL_MAX_WIDTH));
+}
+function visiblePadEnd(input, width) {
+  const remaining = width - stringWidth2(input);
+  return remaining > 0 ? `${input}${" ".repeat(remaining)}` : input;
+}
+function visiblePadStart(input, width) {
+  const remaining = width - stringWidth2(input);
+  return remaining > 0 ? `${" ".repeat(remaining)}${input}` : input;
+}
+function truncateText(input, maxWidth) {
+  if (stringWidth2(input) <= maxWidth) {
+    return input;
+  }
+  let output = "";
+  for (const char of input) {
+    if (stringWidth2(`${output}${char}\u2026`) > maxWidth) {
+      break;
+    }
+    output += char;
+  }
+  return `${output}\u2026`;
+}
+function printBox(title, lines, options) {
+  const width = options?.width ?? terminalWidth();
+  const color = options?.color ?? source_default.gray;
+  const innerWidth = Math.max(20, width - 4);
+  const titleText = title ? ` ${title} ` : "";
+  const topFillWidth = titleText ? Math.max(0, width - stringWidth2(titleText) - 3) : width - 2;
+  const top = titleText ? `${color("\u256D")}${color("\u2500")}${source_default.bold(titleText)}${color("\u2500".repeat(topFillWidth))}${color("\u256E")}` : `${color("\u256D")}${color("\u2500".repeat(width - 2))}${color("\u256E")}`;
+  console.log(top);
+  for (const line of lines) {
+    console.log(`${color("\u2502")} ${visiblePadEnd(line, innerWidth)} ${color("\u2502")}`);
+  }
+  console.log(`${color("\u2570")}${color("\u2500".repeat(width - 2))}${color("\u256F")}`);
+}
+function printSpacer() {
+  console.log("");
 }
 function statusColor(value, warnAt = 0.7, dangerAt = 0.9) {
   if (value >= dangerAt) {
@@ -42485,8 +42525,8 @@ function ratioOrNull(used, total) {
   }
   return used / total;
 }
-function renderMetricLine(label, ratio, detail, options) {
-  const labelText = padLabel(label, 10);
+function formatMetricLine(label, ratio, detail, options) {
+  const labelText = visiblePadEnd(label, 10);
   const gauge = ratio === null ? renderUnknownGauge(options?.width ?? 24) : options?.availability === true ? renderAvailabilityGauge(ratio, {
     width: options.width,
     warnBelow: options.warnBelow,
@@ -42497,7 +42537,7 @@ function renderMetricLine(label, ratio, detail, options) {
     dangerAt: options?.dangerAt
   });
   const percent = ratio === null ? source_default.gray("--") : formatPercent(Math.max(0, ratio));
-  console.log(`  ${labelText} ${gauge} ${percent.padStart(4)}  ${detail}`);
+  return `${labelText} ${gauge} ${visiblePadStart(percent, 4)}  ${detail}`;
 }
 function riskBadge(risk) {
   if (risk === "safe") {
@@ -42570,23 +42610,20 @@ function countByRisk(items) {
     danger: items.filter((item) => item.risk === "danger").length
   };
 }
-function printRiskDistribution(items) {
+function riskDistributionLines(items, width = 18) {
   const total = items.length;
   const counts = countByRisk(items);
   if (total === 0) {
-    return;
+    return [];
   }
-  console.log(source_default.bold("\uC704\uD5D8\uB3C4 \uBD84\uD3EC"));
-  for (const risk of ["safe", "caution", "danger"]) {
+  return ["safe", "caution", "danger"].map((risk) => {
     const count2 = counts[risk];
     const ratio = count2 / total;
-    console.log(
-      `  ${padLabel(RISK_LABELS[risk], 4)} ${renderNeutralGauge(ratio, {
-        width: 18,
-        color: RISK_COLORS[risk]
-      })} ${count2}\uAC1C`
-    );
-  }
+    return `${visiblePadEnd(RISK_LABELS[risk], 4)} ${renderNeutralGauge(ratio, {
+      width,
+      color: RISK_COLORS[risk]
+    })} ${count2}\uAC1C`;
+  });
 }
 async function scanCategories(category) {
   const categories = category ? [category] : [...CATEGORY_IDS];
@@ -42613,38 +42650,54 @@ function printScanResults(results) {
     console.log(source_default.green("\uC815\uB9AC \uAC00\uB2A5 \uD56D\uBAA9\uC774 \uC5C6\uC2B5\uB2C8\uB2E4."));
     return;
   }
-  console.log("");
-  console.log(source_default.bold("\uC2A4\uCE94 \uACB0\uACFC"));
+  printSpacer();
   const totalKnown = sumKnownBytes(allItems);
   const totalUnknown = countUnknownBytes(allItems);
-  console.log(
-    `${source_default.bold("\uC804\uCCB4 \uC608\uC0C1 \uD68C\uC218")} ${formatBytes(totalKnown)}${totalUnknown > 0 ? source_default.gray(` / \uD06C\uAE30 \uBBF8\uD655\uC815 ${totalUnknown}\uAC1C`) : ""}`
+  const counts = countByRisk(allItems);
+  printBox(
+    "tidymac scan",
+    [
+      `${source_default.gray("\uC815\uB9AC \uD6C4\uBCF4")} ${source_default.bold(`${allItems.length}\uAC1C`)}   ${source_default.gray("\uC608\uC0C1 \uD68C\uC218")} ${source_default.bold(
+        formatBytes(totalKnown)
+      )}   ${source_default.gray("\uD06C\uAE30 \uBBF8\uD655\uC815")} ${totalUnknown}\uAC1C`,
+      `${source_default.green("safe")} ${counts.safe}   ${source_default.yellow("caution")} ${counts.caution}   ${source_default.red(
+        "danger"
+      )} ${counts.danger}`,
+      ...riskDistributionLines(allItems, 22)
+    ],
+    { color: source_default.cyan }
   );
-  printRiskDistribution(allItems);
   for (const result of results) {
     if (result.items.length === 0) {
       continue;
     }
+    printSpacer();
     const knownTotal = sumKnownBytes(result.items);
     const unknownCount = countUnknownBytes(result.items);
     const categoryRatio = totalKnown > 0 ? knownTotal / totalKnown : 0;
-    console.log("");
-    console.log(
-      `${categoryBadge(result.category)} ${renderNeutralGauge(categoryRatio, {
-        width: 18,
+    const boxWidth = terminalWidth();
+    const innerWidth = boxWidth - 4;
+    const lines = [
+      `${source_default.gray("\uC694\uC57D")} ${result.items.length}\uAC1C \uD56D\uBAA9   ${source_default.gray("\uC608\uC0C1 \uD68C\uC218")} ${formatBytes(
+        knownTotal
+      )}${unknownCount > 0 ? source_default.gray(`   \uD06C\uAE30 \uBBF8\uD655\uC815 ${unknownCount}\uAC1C`) : ""}`,
+      `${source_default.gray("\uD68C\uC218 \uBE44\uC911")} ${renderNeutralGauge(categoryRatio, {
+        width: 24,
         color: source_default.cyan
-      })} ${result.items.length}\uAC1C / \uC608\uC0C1 \uD68C\uC218 ${formatBytes(knownTotal)}${unknownCount > 0 ? source_default.gray(` / \uD06C\uAE30 \uBBF8\uD655\uC815 ${unknownCount}\uAC1C`) : ""}`
-    );
+      })} ${formatPercent(categoryRatio)}`
+    ];
     for (const item of result.items) {
       const itemRatio = knownTotal > 0 && item.reclaimableBytes !== null ? item.reclaimableBytes / knownTotal : 0;
       const gauge = item.reclaimableBytes === null ? renderUnknownGauge(12) : renderNeutralGauge(itemRatio, { width: 12, color: RISK_COLORS[item.risk] });
-      console.log(
-        `  ${gauge} ${riskBadge(item.risk)} ${sudoBadge(item)}${source_default.bold(item.label)} ${source_default.gray(
-          formatBytes(item.reclaimableBytes)
-        )}`
-      );
-      console.log(`    ${source_default.gray(item.description)}`);
+      const left2 = `${gauge} ${riskBadge(item.risk)} ${sudoBadge(item)}${source_default.bold(
+        truncateText(item.label, 36)
+      )}`;
+      const right2 = source_default.gray(formatBytes(item.reclaimableBytes));
+      const gapWidth = Math.max(2, innerWidth - stringWidth2(left2) - stringWidth2(right2));
+      lines.push(`${left2}${" ".repeat(gapWidth)}${right2}`);
+      lines.push(source_default.gray(`  ${truncateText(item.description, innerWidth - 2)}`));
     }
+    printBox(CATEGORY_LABELS[result.category], lines, { color: source_default.gray, width: boxWidth });
   }
 }
 async function selectItems(items, force) {
@@ -42745,11 +42798,13 @@ function printExecutionSummary(records, dryRun) {
     return;
   }
   const label = dryRun ? "\uC608\uC0C1 \uD68C\uC218" : "\uD68C\uC218";
-  console.log("");
-  console.log(source_default.bold(dryRun ? "Dry-run \uACB0\uACFC" : "\uC815\uB9AC \uACB0\uACFC"));
+  printSpacer();
   const allResults = records.map((record) => record.result);
   const totalKnown = sumKnownBytes(allResults);
   const totalUnknown = countUnknownBytes(allResults);
+  const lines = [
+    `${source_default.gray("\uC804\uCCB4")} ${source_default.bold(formatBytes(totalKnown))}${totalUnknown > 0 ? source_default.gray(`   \uD06C\uAE30 \uBBF8\uD655\uC815 ${totalUnknown}\uAC1C`) : ""}`
+  ];
   for (const category of CATEGORY_IDS) {
     const categoryRecords = records.filter((record) => record.item.category === category);
     if (categoryRecords.length === 0) {
@@ -42759,17 +42814,16 @@ function printExecutionSummary(records, dryRun) {
     const unknownCount = countUnknownBytes(categoryRecords.map((record) => record.result));
     const failures = categoryRecords.filter((record) => !record.result.success).length;
     const ratio = totalKnown > 0 ? knownTotal / totalKnown : 0;
-    console.log(
-      `${categoryBadge(category)} ${renderNeutralGauge(ratio, {
+    lines.push(
+      `${visiblePadEnd(CATEGORY_LABELS[category], 8)} ${renderNeutralGauge(ratio, {
         width: 18,
         color: failures > 0 ? source_default.red : source_default.cyan
       })} ${categoryRecords.length}\uAC1C / ${label} ${formatBytes(knownTotal)}${unknownCount > 0 ? source_default.gray(` / \uD06C\uAE30 \uBBF8\uD655\uC815 ${unknownCount}\uAC1C`) : ""}${failures > 0 ? source_default.red(` / \uC2E4\uD328 ${failures}\uAC1C`) : ""}`
     );
   }
-  console.log(`${source_default.bold(`\uC804\uCCB4 ${label}`)}: ${formatBytes(totalKnown)}`);
-  if (totalUnknown > 0) {
-    console.log(source_default.gray(`\uD06C\uAE30 \uBBF8\uD655\uC815 \uD56D\uBAA9 ${totalUnknown}\uAC1C\uAC00 \uBCC4\uB3C4\uB85C \uC788\uC2B5\uB2C8\uB2E4.`));
-  }
+  printBox(dryRun ? "dry-run \uACB0\uACFC" : "\uC815\uB9AC \uACB0\uACFC", lines, {
+    color: dryRun ? source_default.cyan : source_default.green
+  });
 }
 async function handleScan(options) {
   const category = parseCategory(options.category);
@@ -42883,74 +42937,100 @@ function doctorStatusBadge(status) {
   }
   return source_default.green("\uC815\uC0C1");
 }
+function doctorStatusColor(status) {
+  if (status === "danger") {
+    return source_default.red;
+  }
+  if (status === "caution") {
+    return source_default.yellow;
+  }
+  return source_default.green;
+}
 function renderDoctorResult(result, options) {
   const ratios = doctorRatios(result);
   const status = doctorStatus(result, ratios);
   const scannedAt = result.scannedAt.toLocaleString("ko-KR");
-  console.log(source_default.bold("\uC2DC\uC2A4\uD15C \uC9C4\uB2E8"));
-  console.log(
-    `${source_default.bold("\uC0C1\uD0DC")} ${doctorStatusBadge(status)} ${source_default.gray(`/ \uAC31\uC2E0 ${scannedAt}`)}${options.watch && options.intervalSeconds ? source_default.gray(` / ${options.intervalSeconds}\uCD08 \uAC04\uACA9 / Ctrl+C \uC885\uB8CC`) : ""}${options.watch && options.iteration ? source_default.gray(` / ${options.iteration}\uD68C\uCC28`) : ""}`
+  const boxWidth = terminalWidth();
+  const innerWidth = boxWidth - 4;
+  printBox(
+    "tidymac doctor",
+    [
+      `${source_default.gray("\uC0C1\uD0DC")} ${doctorStatusBadge(status)}   ${source_default.gray("\uAC31\uC2E0")} ${scannedAt}${options.watch && options.intervalSeconds ? source_default.gray(`   \uC8FC\uAE30 ${options.intervalSeconds}\uCD08`) : ""}${options.watch && options.iteration ? source_default.gray(`   ${options.iteration}\uD68C\uCC28`) : ""}`,
+      options.watch ? source_default.gray("Ctrl+C\uB85C watch \uBAA8\uB4DC\uB97C \uC885\uB8CC\uD569\uB2C8\uB2E4.") : source_default.gray("\uD604\uC7AC \uC2DC\uC2A4\uD15C \uC0C1\uD0DC \uC2A4\uB0C5\uC0F7\uC785\uB2C8\uB2E4.")
+    ],
+    { color: doctorStatusColor(status), width: boxWidth }
   );
-  console.log("");
-  console.log(`${source_default.cyan("[\uBA54\uBAA8\uB9AC]")} \uC804\uCCB4 ${formatMaybeBytes(result.memory.totalBytes)}`);
-  renderMetricLine(
-    "\uC0AC\uC6A9\uB960",
-    ratios.memoryUsedRatio,
-    `${formatMaybeBytes(result.memory.usedBytes)} \uC0AC\uC6A9 \uCD94\uC815`,
-    { warnAt: 0.75, dangerAt: 0.9 }
+  printSpacer();
+  printBox(
+    `\uBA54\uBAA8\uB9AC \xB7 \uC804\uCCB4 ${formatMaybeBytes(result.memory.totalBytes)}`,
+    [
+      formatMetricLine("\uC0AC\uC6A9\uB960", ratios.memoryUsedRatio, `${formatMaybeBytes(result.memory.usedBytes)} \uC0AC\uC6A9 \uCD94\uC815`, {
+        warnAt: 0.75,
+        dangerAt: 0.9
+      }),
+      formatMetricLine("\uBE44\uD65C\uC131", ratios.inactiveRatio, `${formatMaybeBytes(result.memory.inactiveBytes)} purge \uD6C4\uBCF4`, {
+        warnAt: 0.5,
+        dangerAt: 0.75
+      }),
+      formatMetricLine("\uC5EC\uC720\uC728", ratios.memoryFreeRatio, "memory_pressure \uAE30\uC900", {
+        availability: true,
+        warnBelow: 0.25,
+        dangerBelow: 0.1
+      }),
+      source_default.gray(
+        truncateText(
+          `\uC138\uBD80 active ${formatMaybeBytes(result.memory.activeBytes)} / wired ${formatMaybeBytes(
+            result.memory.wiredBytes
+          )} / compressed ${formatMaybeBytes(result.memory.compressedBytes)}`,
+          innerWidth
+        )
+      )
+    ],
+    { color: source_default.cyan, width: boxWidth }
   );
-  renderMetricLine(
-    "\uBE44\uD65C\uC131",
-    ratios.inactiveRatio,
-    `${formatMaybeBytes(result.memory.inactiveBytes)} purge \uD6C4\uBCF4`,
-    { warnAt: 0.5, dangerAt: 0.75 }
-  );
-  renderMetricLine(
-    "\uC5EC\uC720\uC728",
-    ratios.memoryFreeRatio,
-    "memory_pressure \uAE30\uC900",
-    { availability: true, warnBelow: 0.25, dangerBelow: 0.1 }
-  );
-  console.log(
-    `  ${source_default.gray("\uC138\uBD80")} active ${formatMaybeBytes(result.memory.activeBytes)} / wired ${formatMaybeBytes(
-      result.memory.wiredBytes
-    )} / compressed ${formatMaybeBytes(result.memory.compressedBytes)}`
-  );
+  printSpacer();
   if (result.disk) {
-    console.log(`${source_default.cyan("[\uB514\uC2A4\uD06C]")} /`);
-    renderMetricLine(
-      "\uC0AC\uC6A9\uB960",
-      ratios.diskUsedRatio,
-      `${prettyBytes(result.disk.usedBytes)} \uC0AC\uC6A9 / ${prettyBytes(result.disk.availableBytes)} \uC5EC\uC720 (${result.disk.capacity})`,
-      { warnAt: 0.75, dangerAt: 0.9 }
-    );
-    renderMetricLine(
-      "\uC5EC\uC720\uC728",
-      ratios.diskAvailableRatio,
-      `${prettyBytes(result.disk.availableBytes)} \uC5EC\uC720`,
-      { availability: true, warnBelow: 0.2, dangerBelow: 0.1 }
+    printBox(
+      "\uB514\uC2A4\uD06C \xB7 /",
+      [
+        formatMetricLine(
+          "\uC0AC\uC6A9\uB960",
+          ratios.diskUsedRatio,
+          `${prettyBytes(result.disk.usedBytes)} \uC0AC\uC6A9 / ${prettyBytes(result.disk.availableBytes)} \uC5EC\uC720 (${result.disk.capacity})`,
+          { warnAt: 0.75, dangerAt: 0.9 }
+        ),
+        formatMetricLine("\uC5EC\uC720\uC728", ratios.diskAvailableRatio, `${prettyBytes(result.disk.availableBytes)} \uC5EC\uC720`, {
+          availability: true,
+          warnBelow: 0.2,
+          dangerBelow: 0.1
+        })
+      ],
+      { color: source_default.cyan, width: boxWidth }
     );
   } else {
-    console.log(`${source_default.cyan("[\uB514\uC2A4\uD06C]")} \uD655\uC778 \uBD88\uAC00`);
+    printBox("\uB514\uC2A4\uD06C", [source_default.yellow("\uB514\uC2A4\uD06C \uC0C1\uD0DC\uB97C \uD655\uC778\uD558\uC9C0 \uBABB\uD588\uC2B5\uB2C8\uB2E4.")], {
+      color: source_default.yellow,
+      width: boxWidth
+    });
   }
-  console.log(`${source_default.cyan("[CPU]")} \uCF54\uC5B4 ${result.cpu.cpuCount}\uAC1C`);
-  renderMetricLine(
-    "1\uBD84",
-    ratios.cpuLoadRatios[0],
-    `loadavg ${result.cpu.loadAverage[0].toFixed(2)}`,
-    { warnAt: 0.7, dangerAt: 1 }
-  );
-  renderMetricLine(
-    "5\uBD84",
-    ratios.cpuLoadRatios[1],
-    `loadavg ${result.cpu.loadAverage[1].toFixed(2)}`,
-    { warnAt: 0.7, dangerAt: 1 }
-  );
-  renderMetricLine(
-    "15\uBD84",
-    ratios.cpuLoadRatios[2],
-    `loadavg ${result.cpu.loadAverage[2].toFixed(2)}`,
-    { warnAt: 0.7, dangerAt: 1 }
+  printSpacer();
+  printBox(
+    `CPU \xB7 ${result.cpu.cpuCount}\uCF54\uC5B4`,
+    [
+      formatMetricLine("1\uBD84", ratios.cpuLoadRatios[0], `loadavg ${result.cpu.loadAverage[0].toFixed(2)}`, {
+        warnAt: 0.7,
+        dangerAt: 1
+      }),
+      formatMetricLine("5\uBD84", ratios.cpuLoadRatios[1], `loadavg ${result.cpu.loadAverage[1].toFixed(2)}`, {
+        warnAt: 0.7,
+        dangerAt: 1
+      }),
+      formatMetricLine("15\uBD84", ratios.cpuLoadRatios[2], `loadavg ${result.cpu.loadAverage[2].toFixed(2)}`, {
+        warnAt: 0.7,
+        dangerAt: 1
+      })
+    ],
+    { color: source_default.cyan, width: boxWidth }
   );
 }
 function parseDoctorIntervalSeconds(value) {
@@ -42969,12 +43049,18 @@ function clearTerminalScreen() {
 async function watchDoctor(intervalSeconds) {
   let running = true;
   let iteration = 0;
+  let stopping = false;
   const abortController = new AbortController();
   const stop = () => {
+    if (stopping) {
+      return;
+    }
+    stopping = true;
     running = false;
     abortController.abort();
   };
-  process.once("SIGINT", stop);
+  process.on("SIGINT", stop);
+  process.on("SIGTERM", stop);
   process.stdout.write("\x1B[?25l");
   try {
     while (running) {
@@ -43002,6 +43088,8 @@ async function watchDoctor(intervalSeconds) {
   } finally {
     process.stdout.write("\x1B[?25h");
     process.off("SIGINT", stop);
+    process.off("SIGTERM", stop);
+    process.exitCode = 0;
     console.log("");
     console.log(source_default.gray("doctor watch \uBAA8\uB4DC\uB97C \uC885\uB8CC\uD588\uC2B5\uB2C8\uB2E4."));
   }

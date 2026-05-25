@@ -7,6 +7,7 @@ import { Command, type Help } from "commander";
 import inquirer from "inquirer";
 import ora from "ora";
 import prettyBytes from "pretty-bytes";
+import stringWidth from "string-width";
 import { scanCpu } from "./categories/cpu.js";
 import { scanDisk } from "./categories/disk.js";
 import { scanMemory } from "./categories/memory.js";
@@ -50,6 +51,9 @@ const SCANNERS: Record<CategoryId, () => Promise<ScanResult>> = {
   cpu: scanCpu,
   network: scanNetwork
 };
+
+const PANEL_MAX_WIDTH = 108;
+const PANEL_MIN_WIDTH = 72;
 
 interface CleanOptions {
   category?: string;
@@ -106,8 +110,57 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
-function padLabel(label: string, width: number): string {
-  return label.length >= width ? label : label.padEnd(width);
+function terminalWidth(): number {
+  const columns = process.stdout.columns ?? 96;
+  return Math.round(clamp(columns, PANEL_MIN_WIDTH, PANEL_MAX_WIDTH));
+}
+
+function visiblePadEnd(input: string, width: number): string {
+  const remaining = width - stringWidth(input);
+  return remaining > 0 ? `${input}${" ".repeat(remaining)}` : input;
+}
+
+function visiblePadStart(input: string, width: number): string {
+  const remaining = width - stringWidth(input);
+  return remaining > 0 ? `${" ".repeat(remaining)}${input}` : input;
+}
+
+function truncateText(input: string, maxWidth: number): string {
+  if (stringWidth(input) <= maxWidth) {
+    return input;
+  }
+
+  let output = "";
+  for (const char of input) {
+    if (stringWidth(`${output}${char}…`) > maxWidth) {
+      break;
+    }
+
+    output += char;
+  }
+
+  return `${output}…`;
+}
+
+function printBox(title: string, lines: string[], options?: { color?: ChalkInstance; width?: number }): void {
+  const width = options?.width ?? terminalWidth();
+  const color = options?.color ?? chalk.gray;
+  const innerWidth = Math.max(20, width - 4);
+  const titleText = title ? ` ${title} ` : "";
+  const topFillWidth = titleText ? Math.max(0, width - stringWidth(titleText) - 3) : width - 2;
+  const top = titleText
+    ? `${color("╭")}${color("─")}${chalk.bold(titleText)}${color("─".repeat(topFillWidth))}${color("╮")}`
+    : `${color("╭")}${color("─".repeat(width - 2))}${color("╮")}`;
+
+  console.log(top);
+  for (const line of lines) {
+    console.log(`${color("│")} ${visiblePadEnd(line, innerWidth)} ${color("│")}`);
+  }
+  console.log(`${color("╰")}${color("─".repeat(width - 2))}${color("╯")}`);
+}
+
+function printSpacer(): void {
+  console.log("");
 }
 
 function statusColor(value: number, warnAt = 0.7, dangerAt = 0.9): ChalkInstance {
@@ -176,7 +229,7 @@ function ratioOrNull(used: number | null, total: number | null): number | null {
   return used / total;
 }
 
-function renderMetricLine(
+function formatMetricLine(
   label: string,
   ratio: number | null,
   detail: string,
@@ -188,8 +241,8 @@ function renderMetricLine(
     warnBelow?: number;
     dangerBelow?: number;
   }
-): void {
-  const labelText = padLabel(label, 10);
+): string {
+  const labelText = visiblePadEnd(label, 10);
   const gauge =
     ratio === null
       ? renderUnknownGauge(options?.width ?? 24)
@@ -205,7 +258,7 @@ function renderMetricLine(
             dangerAt: options?.dangerAt
           });
   const percent = ratio === null ? chalk.gray("--") : formatPercent(Math.max(0, ratio));
-  console.log(`  ${labelText} ${gauge} ${percent.padStart(4)}  ${detail}`);
+  return `${labelText} ${gauge} ${visiblePadStart(percent, 4)}  ${detail}`;
 }
 
 function riskBadge(risk: RiskLevel): string {
@@ -299,25 +352,22 @@ function countByRisk(items: CleanableItem[]): Record<RiskLevel, number> {
   };
 }
 
-function printRiskDistribution(items: CleanableItem[]): void {
+function riskDistributionLines(items: CleanableItem[], width = 18): string[] {
   const total = items.length;
   const counts = countByRisk(items);
 
   if (total === 0) {
-    return;
+    return [];
   }
 
-  console.log(chalk.bold("위험도 분포"));
-  for (const risk of ["safe", "caution", "danger"] as const) {
+  return (["safe", "caution", "danger"] as const).map((risk) => {
     const count = counts[risk];
     const ratio = count / total;
-    console.log(
-      `  ${padLabel(RISK_LABELS[risk], 4)} ${renderNeutralGauge(ratio, {
-        width: 18,
-        color: RISK_COLORS[risk]
-      })} ${count}개`
-    );
-  }
+    return `${visiblePadEnd(RISK_LABELS[risk], 4)} ${renderNeutralGauge(ratio, {
+      width,
+      color: RISK_COLORS[risk]
+    })} ${count}개`;
+  });
 }
 
 async function scanCategories(category?: CategoryId): Promise<ScanResult[]> {
@@ -350,35 +400,45 @@ function printScanResults(results: ScanResult[]): void {
     return;
   }
 
-  console.log("");
-  console.log(chalk.bold("스캔 결과"));
+  printSpacer();
   const totalKnown = sumKnownBytes(allItems);
   const totalUnknown = countUnknownBytes(allItems);
+  const counts = countByRisk(allItems);
 
-  console.log(
-    `${chalk.bold("전체 예상 회수")} ${formatBytes(totalKnown)}${
-      totalUnknown > 0 ? chalk.gray(` / 크기 미확정 ${totalUnknown}개`) : ""
-    }`
+  printBox(
+    "tidymac scan",
+    [
+      `${chalk.gray("정리 후보")} ${chalk.bold(`${allItems.length}개`)}   ${chalk.gray("예상 회수")} ${chalk.bold(
+        formatBytes(totalKnown)
+      )}   ${chalk.gray("크기 미확정")} ${totalUnknown}개`,
+      `${chalk.green("safe")} ${counts.safe}   ${chalk.yellow("caution")} ${counts.caution}   ${chalk.red(
+        "danger"
+      )} ${counts.danger}`,
+      ...riskDistributionLines(allItems, 22)
+    ],
+    { color: chalk.cyan }
   );
-  printRiskDistribution(allItems);
 
   for (const result of results) {
     if (result.items.length === 0) {
       continue;
     }
 
+    printSpacer();
     const knownTotal = sumKnownBytes(result.items);
     const unknownCount = countUnknownBytes(result.items);
     const categoryRatio = totalKnown > 0 ? knownTotal / totalKnown : 0;
-    console.log("");
-    console.log(
-      `${categoryBadge(result.category)} ${renderNeutralGauge(categoryRatio, {
-        width: 18,
+    const boxWidth = terminalWidth();
+    const innerWidth = boxWidth - 4;
+    const lines = [
+      `${chalk.gray("요약")} ${result.items.length}개 항목   ${chalk.gray("예상 회수")} ${formatBytes(
+        knownTotal
+      )}${unknownCount > 0 ? chalk.gray(`   크기 미확정 ${unknownCount}개`) : ""}`,
+      `${chalk.gray("회수 비중")} ${renderNeutralGauge(categoryRatio, {
+        width: 24,
         color: chalk.cyan
-      })} ${result.items.length}개 / 예상 회수 ${formatBytes(knownTotal)}${
-        unknownCount > 0 ? chalk.gray(` / 크기 미확정 ${unknownCount}개`) : ""
-      }`
-    );
+      })} ${formatPercent(categoryRatio)}`
+    ];
 
     for (const item of result.items) {
       const itemRatio = knownTotal > 0 && item.reclaimableBytes !== null ? item.reclaimableBytes / knownTotal : 0;
@@ -386,13 +446,16 @@ function printScanResults(results: ScanResult[]): void {
         item.reclaimableBytes === null
           ? renderUnknownGauge(12)
           : renderNeutralGauge(itemRatio, { width: 12, color: RISK_COLORS[item.risk] });
-      console.log(
-        `  ${gauge} ${riskBadge(item.risk)} ${sudoBadge(item)}${chalk.bold(item.label)} ${chalk.gray(
-          formatBytes(item.reclaimableBytes)
-        )}`
-      );
-      console.log(`    ${chalk.gray(item.description)}`);
+      const left = `${gauge} ${riskBadge(item.risk)} ${sudoBadge(item)}${chalk.bold(
+        truncateText(item.label, 36)
+      )}`;
+      const right = chalk.gray(formatBytes(item.reclaimableBytes));
+      const gapWidth = Math.max(2, innerWidth - stringWidth(left) - stringWidth(right));
+      lines.push(`${left}${" ".repeat(gapWidth)}${right}`);
+      lines.push(chalk.gray(`  ${truncateText(item.description, innerWidth - 2)}`));
     }
+
+    printBox(CATEGORY_LABELS[result.category], lines, { color: chalk.gray, width: boxWidth });
   }
 }
 
@@ -512,11 +575,15 @@ function printExecutionSummary(records: ExecutionRecord[], dryRun: boolean): voi
   }
 
   const label = dryRun ? "예상 회수" : "회수";
-  console.log("");
-  console.log(chalk.bold(dryRun ? "Dry-run 결과" : "정리 결과"));
+  printSpacer();
   const allResults = records.map((record) => record.result);
   const totalKnown = sumKnownBytes(allResults);
   const totalUnknown = countUnknownBytes(allResults);
+  const lines: string[] = [
+    `${chalk.gray("전체")} ${chalk.bold(formatBytes(totalKnown))}${
+      totalUnknown > 0 ? chalk.gray(`   크기 미확정 ${totalUnknown}개`) : ""
+    }`
+  ];
 
   for (const category of CATEGORY_IDS) {
     const categoryRecords = records.filter((record) => record.item.category === category);
@@ -529,8 +596,8 @@ function printExecutionSummary(records: ExecutionRecord[], dryRun: boolean): voi
     const failures = categoryRecords.filter((record) => !record.result.success).length;
     const ratio = totalKnown > 0 ? knownTotal / totalKnown : 0;
 
-    console.log(
-      `${categoryBadge(category)} ${renderNeutralGauge(ratio, {
+    lines.push(
+      `${visiblePadEnd(CATEGORY_LABELS[category], 8)} ${renderNeutralGauge(ratio, {
         width: 18,
         color: failures > 0 ? chalk.red : chalk.cyan
       })} ${categoryRecords.length}개 / ${label} ${formatBytes(knownTotal)}${
@@ -539,10 +606,9 @@ function printExecutionSummary(records: ExecutionRecord[], dryRun: boolean): voi
     );
   }
 
-  console.log(`${chalk.bold(`전체 ${label}`)}: ${formatBytes(totalKnown)}`);
-  if (totalUnknown > 0) {
-    console.log(chalk.gray(`크기 미확정 항목 ${totalUnknown}개가 별도로 있습니다.`));
-  }
+  printBox(dryRun ? "dry-run 결과" : "정리 결과", lines, {
+    color: dryRun ? chalk.cyan : chalk.green
+  });
 }
 
 async function handleScan(options: ScanOptions): Promise<void> {
@@ -702,82 +768,109 @@ function doctorStatusBadge(status: DoctorStatus): string {
   return chalk.green("정상");
 }
 
+function doctorStatusColor(status: DoctorStatus): ChalkInstance {
+  if (status === "danger") {
+    return chalk.red;
+  }
+
+  if (status === "caution") {
+    return chalk.yellow;
+  }
+
+  return chalk.green;
+}
+
 function renderDoctorResult(result: DoctorDiagnosis, options: DoctorRenderOptions): void {
   const ratios = doctorRatios(result);
   const status = doctorStatus(result, ratios);
   const scannedAt = result.scannedAt.toLocaleString("ko-KR");
+  const boxWidth = terminalWidth();
+  const innerWidth = boxWidth - 4;
 
-  console.log(chalk.bold("시스템 진단"));
-  console.log(
-    `${chalk.bold("상태")} ${doctorStatusBadge(status)} ${chalk.gray(`/ 갱신 ${scannedAt}`)}${
-      options.watch && options.intervalSeconds
-        ? chalk.gray(` / ${options.intervalSeconds}초 간격 / Ctrl+C 종료`)
-        : ""
-    }${options.watch && options.iteration ? chalk.gray(` / ${options.iteration}회차`) : ""}`
-  );
-  console.log("");
-
-  console.log(`${chalk.cyan("[메모리]")} 전체 ${formatMaybeBytes(result.memory.totalBytes)}`);
-  renderMetricLine(
-    "사용률",
-    ratios.memoryUsedRatio,
-    `${formatMaybeBytes(result.memory.usedBytes)} 사용 추정`,
-    { warnAt: 0.75, dangerAt: 0.9 }
-  );
-  renderMetricLine(
-    "비활성",
-    ratios.inactiveRatio,
-    `${formatMaybeBytes(result.memory.inactiveBytes)} purge 후보`,
-    { warnAt: 0.5, dangerAt: 0.75 }
-  );
-  renderMetricLine(
-    "여유율",
-    ratios.memoryFreeRatio,
-    "memory_pressure 기준",
-    { availability: true, warnBelow: 0.25, dangerBelow: 0.1 }
-  );
-  console.log(
-    `  ${chalk.gray("세부")} active ${formatMaybeBytes(result.memory.activeBytes)} / wired ${formatMaybeBytes(
-      result.memory.wiredBytes
-    )} / compressed ${formatMaybeBytes(result.memory.compressedBytes)}`
+  printBox(
+    "tidymac doctor",
+    [
+      `${chalk.gray("상태")} ${doctorStatusBadge(status)}   ${chalk.gray("갱신")} ${scannedAt}${
+        options.watch && options.intervalSeconds ? chalk.gray(`   주기 ${options.intervalSeconds}초`) : ""
+      }${options.watch && options.iteration ? chalk.gray(`   ${options.iteration}회차`) : ""}`,
+      options.watch ? chalk.gray("Ctrl+C로 watch 모드를 종료합니다.") : chalk.gray("현재 시스템 상태 스냅샷입니다.")
+    ],
+    { color: doctorStatusColor(status), width: boxWidth }
   );
 
+  printSpacer();
+  printBox(
+    `메모리 · 전체 ${formatMaybeBytes(result.memory.totalBytes)}`,
+    [
+      formatMetricLine("사용률", ratios.memoryUsedRatio, `${formatMaybeBytes(result.memory.usedBytes)} 사용 추정`, {
+        warnAt: 0.75,
+        dangerAt: 0.9
+      }),
+      formatMetricLine("비활성", ratios.inactiveRatio, `${formatMaybeBytes(result.memory.inactiveBytes)} purge 후보`, {
+        warnAt: 0.5,
+        dangerAt: 0.75
+      }),
+      formatMetricLine("여유율", ratios.memoryFreeRatio, "memory_pressure 기준", {
+        availability: true,
+        warnBelow: 0.25,
+        dangerBelow: 0.1
+      }),
+      chalk.gray(
+        truncateText(
+          `세부 active ${formatMaybeBytes(result.memory.activeBytes)} / wired ${formatMaybeBytes(
+            result.memory.wiredBytes
+          )} / compressed ${formatMaybeBytes(result.memory.compressedBytes)}`,
+          innerWidth
+        )
+      )
+    ],
+    { color: chalk.cyan, width: boxWidth }
+  );
+
+  printSpacer();
   if (result.disk) {
-    console.log(`${chalk.cyan("[디스크]")} /`);
-    renderMetricLine(
-      "사용률",
-      ratios.diskUsedRatio,
-      `${prettyBytes(result.disk.usedBytes)} 사용 / ${prettyBytes(result.disk.availableBytes)} 여유 (${result.disk.capacity})`,
-      { warnAt: 0.75, dangerAt: 0.9 }
-    );
-    renderMetricLine(
-      "여유율",
-      ratios.diskAvailableRatio,
-      `${prettyBytes(result.disk.availableBytes)} 여유`,
-      { availability: true, warnBelow: 0.2, dangerBelow: 0.1 }
+    printBox(
+      "디스크 · /",
+      [
+        formatMetricLine(
+          "사용률",
+          ratios.diskUsedRatio,
+          `${prettyBytes(result.disk.usedBytes)} 사용 / ${prettyBytes(result.disk.availableBytes)} 여유 (${result.disk.capacity})`,
+          { warnAt: 0.75, dangerAt: 0.9 }
+        ),
+        formatMetricLine("여유율", ratios.diskAvailableRatio, `${prettyBytes(result.disk.availableBytes)} 여유`, {
+          availability: true,
+          warnBelow: 0.2,
+          dangerBelow: 0.1
+        })
+      ],
+      { color: chalk.cyan, width: boxWidth }
     );
   } else {
-    console.log(`${chalk.cyan("[디스크]")} 확인 불가`);
+    printBox("디스크", [chalk.yellow("디스크 상태를 확인하지 못했습니다.")], {
+      color: chalk.yellow,
+      width: boxWidth
+    });
   }
 
-  console.log(`${chalk.cyan("[CPU]")} 코어 ${result.cpu.cpuCount}개`);
-  renderMetricLine(
-    "1분",
-    ratios.cpuLoadRatios[0],
-    `loadavg ${result.cpu.loadAverage[0].toFixed(2)}`,
-    { warnAt: 0.7, dangerAt: 1 }
-  );
-  renderMetricLine(
-    "5분",
-    ratios.cpuLoadRatios[1],
-    `loadavg ${result.cpu.loadAverage[1].toFixed(2)}`,
-    { warnAt: 0.7, dangerAt: 1 }
-  );
-  renderMetricLine(
-    "15분",
-    ratios.cpuLoadRatios[2],
-    `loadavg ${result.cpu.loadAverage[2].toFixed(2)}`,
-    { warnAt: 0.7, dangerAt: 1 }
+  printSpacer();
+  printBox(
+    `CPU · ${result.cpu.cpuCount}코어`,
+    [
+      formatMetricLine("1분", ratios.cpuLoadRatios[0], `loadavg ${result.cpu.loadAverage[0].toFixed(2)}`, {
+        warnAt: 0.7,
+        dangerAt: 1
+      }),
+      formatMetricLine("5분", ratios.cpuLoadRatios[1], `loadavg ${result.cpu.loadAverage[1].toFixed(2)}`, {
+        warnAt: 0.7,
+        dangerAt: 1
+      }),
+      formatMetricLine("15분", ratios.cpuLoadRatios[2], `loadavg ${result.cpu.loadAverage[2].toFixed(2)}`, {
+        warnAt: 0.7,
+        dangerAt: 1
+      })
+    ],
+    { color: chalk.cyan, width: boxWidth }
   );
 }
 
@@ -801,14 +894,21 @@ function clearTerminalScreen(): void {
 async function watchDoctor(intervalSeconds: number): Promise<void> {
   let running = true;
   let iteration = 0;
+  let stopping = false;
   const abortController = new AbortController();
 
   const stop = (): void => {
+    if (stopping) {
+      return;
+    }
+
+    stopping = true;
     running = false;
     abortController.abort();
   };
 
-  process.once("SIGINT", stop);
+  process.on("SIGINT", stop);
+  process.on("SIGTERM", stop);
   process.stdout.write("\x1B[?25l");
 
   try {
@@ -840,6 +940,8 @@ async function watchDoctor(intervalSeconds: number): Promise<void> {
   } finally {
     process.stdout.write("\x1B[?25h");
     process.off("SIGINT", stop);
+    process.off("SIGTERM", stop);
+    process.exitCode = 0;
     console.log("");
     console.log(chalk.gray("doctor watch 모드를 종료했습니다."));
   }
