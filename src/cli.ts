@@ -54,6 +54,7 @@ const SCANNERS: Record<CategoryId, () => Promise<ScanResult>> = {
 
 const PANEL_MAX_WIDTH = 108;
 const PANEL_MIN_WIDTH = 72;
+const MIN_TERMINAL_WIDTH = 40;
 
 interface CleanOptions {
   category?: string;
@@ -77,6 +78,16 @@ interface DoctorOptions {
 interface ExecutionRecord {
   item: CleanableItem;
   result: ExecuteResult;
+}
+
+type ExecutionStatus = "pending" | "running" | "success" | "failed";
+
+interface ExecutionProgressEntry {
+  item: CleanableItem;
+  status: ExecutionStatus;
+  result?: ExecuteResult;
+  startedAt?: number;
+  finishedAt?: number;
 }
 
 function ensureDarwin(): void {
@@ -111,8 +122,13 @@ function clamp(value: number, min: number, max: number): number {
 }
 
 function terminalWidth(): number {
-  const columns = process.stdout.columns ?? 96;
-  return Math.round(clamp(columns, PANEL_MIN_WIDTH, PANEL_MAX_WIDTH));
+  const columns = process.stdout.columns;
+
+  if (columns === undefined) {
+    return Math.round(clamp(96, PANEL_MIN_WIDTH, PANEL_MAX_WIDTH));
+  }
+
+  return Math.round(clamp(columns, Math.min(columns, MIN_TERMINAL_WIDTH), Math.min(columns, PANEL_MAX_WIDTH)));
 }
 
 function visiblePadEnd(input: string, width: number): string {
@@ -126,37 +142,68 @@ function visiblePadStart(input: string, width: number): string {
 }
 
 function truncateText(input: string, maxWidth: number): string {
+  if (maxWidth <= 0) {
+    return "";
+  }
+
   if (stringWidth(input) <= maxWidth) {
     return input;
   }
 
+  const ellipsis = "…";
+  const ansiPattern = /^\x1B\[[0-?]*[ -/]*[@-~]/;
   let output = "";
-  for (const char of input) {
-    if (stringWidth(`${output}${char}…`) > maxWidth) {
+  let visibleWidth = 0;
+  let index = 0;
+
+  while (index < input.length) {
+    const sequence = input.slice(index).match(ansiPattern)?.[0];
+    if (sequence) {
+      output += sequence;
+      index += sequence.length;
+      continue;
+    }
+
+    const codePoint = input.codePointAt(index);
+    if (codePoint === undefined) {
       break;
     }
 
+    const char = String.fromCodePoint(codePoint);
+    const nextWidth = visibleWidth + stringWidth(char);
+    if (nextWidth + stringWidth(ellipsis) > maxWidth) {
+      break;
+    }
+
+    visibleWidth = nextWidth;
     output += char;
+    index += char.length;
   }
 
-  return `${output}…`;
+  return `${output}\x1B[0m${ellipsis}`;
 }
 
-function printBox(title: string, lines: string[], options?: { color?: ChalkInstance; width?: number }): void {
+function renderBoxLines(title: string, lines: string[], options?: { color?: ChalkInstance; width?: number }): string[] {
   const width = options?.width ?? terminalWidth();
   const color = options?.color ?? chalk.gray;
   const innerWidth = Math.max(20, width - 4);
-  const titleText = title ? ` ${title} ` : "";
+  const titleText = title ? truncateText(` ${title} `, Math.max(0, width - 3)) : "";
   const topFillWidth = titleText ? Math.max(0, width - stringWidth(titleText) - 3) : width - 2;
   const top = titleText
     ? `${color("╭")}${color("─")}${chalk.bold(titleText)}${color("─".repeat(topFillWidth))}${color("╮")}`
     : `${color("╭")}${color("─".repeat(width - 2))}${color("╮")}`;
 
-  console.log(top);
+  const renderedLines = [top];
   for (const line of lines) {
-    console.log(`${color("│")} ${visiblePadEnd(line, innerWidth)} ${color("│")}`);
+    const content = truncateText(line, innerWidth);
+    renderedLines.push(`${color("│")} ${visiblePadEnd(content, innerWidth)} ${color("│")}`);
   }
-  console.log(`${color("╰")}${color("─".repeat(width - 2))}${color("╯")}`);
+  renderedLines.push(`${color("╰")}${color("─".repeat(width - 2))}${color("╯")}`);
+  return renderedLines;
+}
+
+function printBox(title: string, lines: string[], options?: { color?: ChalkInstance; width?: number }): void {
+  console.log(renderBoxLines(title, lines, options).join("\n"));
 }
 
 function printSpacer(): void {
@@ -219,6 +266,28 @@ function renderNeutralGauge(value: number, options?: { width?: number; color?: C
 
 function renderUnknownGauge(width = 24): string {
   return chalk.gray("░".repeat(width));
+}
+
+function formatDuration(milliseconds: number): string {
+  const totalSeconds = Math.max(0, Math.round(milliseconds / 1000));
+
+  if (totalSeconds === 0) {
+    return "0초";
+  }
+
+  if (totalSeconds < 60) {
+    return `${totalSeconds}초`;
+  }
+
+  const totalMinutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (totalMinutes < 60) {
+    return `${totalMinutes}분 ${seconds.toString().padStart(2, "0")}초`;
+  }
+
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  return `${hours}시간 ${minutes.toString().padStart(2, "0")}분`;
 }
 
 function ratioOrNull(used: number | null, total: number | null): number | null {
@@ -527,32 +596,407 @@ function makeHistoryEntry(item: CleanableItem, result: ExecuteResult, dryRun: bo
   };
 }
 
+const PROGRESS_REFRESH_MS = 250;
+const PROGRESS_LIST_LIMIT = 6;
+
+function isCompletedProgress(entry: ExecutionProgressEntry): boolean {
+  return entry.status === "success" || entry.status === "failed";
+}
+
+function progressSymbol(status: ExecutionStatus): string {
+  if (status === "running") {
+    return chalk.cyan("▶");
+  }
+
+  if (status === "success") {
+    return chalk.green("✓");
+  }
+
+  if (status === "failed") {
+    return chalk.red("✗");
+  }
+
+  return chalk.gray("•");
+}
+
+function progressItemLabel(item: CleanableItem): string {
+  return `${CATEGORY_LABELS[item.category]} · ${item.requiresSudo ? "[sudo] " : ""}${item.label}`;
+}
+
+function progressEntryDuration(entry: ExecutionProgressEntry, now: number): string | null {
+  if (entry.startedAt === undefined) {
+    return null;
+  }
+
+  return formatDuration((entry.finishedAt ?? now) - entry.startedAt);
+}
+
+function formatProgressEntry(entry: ExecutionProgressEntry, now: number, innerWidth: number): string {
+  const symbol = progressSymbol(entry.status);
+  const label = progressItemLabel(entry.item);
+  const bytes = entry.result ? entry.result.reclaimedBytes : entry.item.reclaimableBytes;
+  const duration = progressEntryDuration(entry, now);
+  const statusText =
+    entry.status === "failed"
+      ? chalk.red("실패")
+      : entry.status === "success"
+        ? chalk.green("완료")
+        : entry.status === "running"
+          ? chalk.cyan("진행")
+          : chalk.gray("대기");
+  const right = [statusText, chalk.gray(formatBytes(bytes)), duration ? chalk.gray(duration) : null]
+    .filter((part): part is string => part !== null)
+    .join(chalk.gray(" · "));
+  const prefix = `${symbol} `;
+  const maxLabelWidth = Math.max(8, innerWidth - stringWidth(prefix) - stringWidth(right) - 2);
+  const left = `${prefix}${truncateText(label, maxLabelWidth)}`;
+  const gapWidth = Math.max(1, innerWidth - stringWidth(left) - stringWidth(right));
+
+  return `${left}${" ".repeat(gapWidth)}${right}`;
+}
+
+function averageCompletedDuration(entries: ExecutionProgressEntry[]): number | null {
+  const durations = entries
+    .filter(isCompletedProgress)
+    .map((entry) =>
+      entry.startedAt !== undefined && entry.finishedAt !== undefined ? entry.finishedAt - entry.startedAt : null
+    )
+    .filter((duration): duration is number => duration !== null && duration > 0);
+
+  if (durations.length === 0) {
+    return null;
+  }
+
+  return durations.reduce((sum, duration) => sum + duration, 0) / durations.length;
+}
+
+function estimateRemainingDuration(
+  entries: ExecutionProgressEntry[],
+  runningEntry: ExecutionProgressEntry | undefined,
+  pendingCount: number,
+  now: number
+): number | null {
+  if (entries.every(isCompletedProgress)) {
+    return 0;
+  }
+
+  const averageDuration = averageCompletedDuration(entries);
+  if (averageDuration === null) {
+    return null;
+  }
+
+  const runningElapsed =
+    runningEntry?.startedAt === undefined ? 0 : Math.max(0, now - runningEntry.startedAt);
+  const runningRemaining = runningEntry
+    ? Math.max(averageDuration - runningElapsed, averageDuration * 0.25)
+    : 0;
+
+  return runningRemaining + pendingCount * averageDuration;
+}
+
+function estimateProgressRatio(entries: ExecutionProgressEntry[], runningEntry: ExecutionProgressEntry | undefined, now: number): number {
+  if (entries.length === 0) {
+    return 1;
+  }
+
+  const completedCount = entries.filter(isCompletedProgress).length;
+  const averageDuration = averageCompletedDuration(entries);
+  const runningElapsed =
+    runningEntry?.startedAt === undefined ? 0 : Math.max(0, now - runningEntry.startedAt);
+  const runningFraction =
+    runningEntry === undefined
+      ? 0
+      : averageDuration === null
+        ? 0.1
+        : clamp(runningElapsed / averageDuration, 0.05, 0.95);
+
+  return clamp((completedCount + runningFraction) / entries.length, 0, 1);
+}
+
+function renderCleanProgress(entries: ExecutionProgressEntry[], dryRun: boolean, startedAt: number, now: number): string[] {
+  const boxWidth = terminalWidth();
+  const innerWidth = boxWidth - 4;
+  const completedEntries = entries.filter(isCompletedProgress);
+  const runningEntry = entries.find((entry) => entry.status === "running");
+  const pendingEntries = entries.filter((entry) => entry.status === "pending");
+  const failures = completedEntries.filter((entry) => entry.status === "failed").length;
+  const remainingCount = pendingEntries.length + (runningEntry ? 1 : 0);
+  const progressRatio = estimateProgressRatio(entries, runningEntry, now);
+  const eta = estimateRemainingDuration(entries, runningEntry, pendingEntries.length, now);
+  const plannedItems = entries.map((entry) => entry.item);
+  const totalKnown = sumKnownBytes(plannedItems);
+  const totalUnknown = countUnknownBytes(plannedItems);
+  const reclaimedKnown = sumKnownBytes(completedEntries.map((entry) => entry.result ?? { reclaimedBytes: 0 }));
+  const reclaimedUnknown = completedEntries.filter((entry) => entry.result?.reclaimedBytes === null).length;
+  const completedLabel = `${completedEntries.length}/${entries.length}`;
+  const failureLabel = failures > 0 ? chalk.red(`${failures}`) : `${failures}`;
+  const modeLabel = dryRun ? chalk.cyan("dry-run") : chalk.green("실행");
+  const gaugeColor = failures > 0 ? chalk.yellow : dryRun ? chalk.cyan : chalk.green;
+  const lines: string[] = [
+    `${chalk.gray("모드")} ${modeLabel}   ${chalk.gray("완료")} ${chalk.bold(
+      completedLabel
+    )}   ${chalk.gray("남음")} ${remainingCount}   ${chalk.gray("실패")} ${failureLabel}`,
+    `${chalk.gray("진행률")} ${renderNeutralGauge(progressRatio, {
+      width: 18,
+      color: gaugeColor
+    })} ${visiblePadStart(formatPercent(progressRatio), 4)}   ${chalk.gray("경과")} ${formatDuration(
+      now - startedAt
+    )}   ${chalk.gray("예상 남은")} ${eta === null ? chalk.gray("계산 중") : formatDuration(eta)}`,
+    dryRun
+      ? `${chalk.gray("예상 회수")} ${formatBytes(totalKnown)}${
+          totalUnknown > 0 ? chalk.gray(`   크기 미확정 ${totalUnknown}개`) : ""
+        }`
+      : `${chalk.gray("회수")} ${formatBytes(reclaimedKnown)}${
+          reclaimedUnknown > 0 ? chalk.gray(`   크기 미확정 ${reclaimedUnknown}개`) : ""
+        }   ${chalk.gray("예상")} ${formatBytes(totalKnown)}${
+          totalUnknown > 0 ? chalk.gray(`   미확정 ${totalUnknown}개`) : ""
+        }`
+  ];
+
+  lines.push("");
+  if (runningEntry) {
+    lines.push(chalk.bold("진행 중"));
+    lines.push(formatProgressEntry(runningEntry, now, innerWidth));
+    lines.push(chalk.gray(`  ${truncateText(runningEntry.item.description, innerWidth - 2)}`));
+  } else {
+    lines.push(`${chalk.bold("진행 중")} ${chalk.gray("없음")}`);
+  }
+
+  lines.push("");
+  lines.push(chalk.bold(`완료된 작업 ${completedEntries.length}개`));
+  if (completedEntries.length === 0) {
+    lines.push(chalk.gray("  아직 완료된 작업이 없습니다."));
+  } else {
+    const visibleCompleted = completedEntries.slice(-PROGRESS_LIST_LIMIT);
+    const hiddenCompletedCount = completedEntries.length - visibleCompleted.length;
+    if (hiddenCompletedCount > 0) {
+      lines.push(chalk.gray(`  이전 완료 ${hiddenCompletedCount}개 생략`));
+    }
+
+    for (const entry of visibleCompleted) {
+      lines.push(formatProgressEntry(entry, now, innerWidth));
+      if (entry.status === "failed" && entry.result) {
+        lines.push(chalk.red(`  ${truncateText(entry.result.message, innerWidth - 2)}`));
+      }
+    }
+  }
+
+  lines.push("");
+  lines.push(chalk.bold(`남은 작업 ${pendingEntries.length}개`));
+  if (pendingEntries.length === 0) {
+    lines.push(chalk.gray("  대기 중인 작업이 없습니다."));
+  } else {
+    const visiblePending = pendingEntries.slice(0, PROGRESS_LIST_LIMIT);
+    for (const entry of visiblePending) {
+      lines.push(formatProgressEntry(entry, now, innerWidth));
+    }
+
+    if (pendingEntries.length > visiblePending.length) {
+      lines.push(chalk.gray(`  이후 작업 ${pendingEntries.length - visiblePending.length}개 더 있음`));
+    }
+  }
+
+  return renderBoxLines(dryRun ? "tidymac dry-run 진행" : "tidymac clean 진행", lines, {
+    color: failures > 0 ? chalk.yellow : dryRun ? chalk.cyan : chalk.green,
+    width: boxWidth
+  });
+}
+
+class CleanProgressRenderer {
+  private readonly entries: ExecutionProgressEntry[];
+  private readonly live: boolean;
+  private readonly startedAt = Date.now();
+  private timer: ReturnType<typeof setInterval> | null = null;
+  private lineCount = 0;
+  private suspended = false;
+
+  constructor(items: CleanableItem[], private readonly dryRun: boolean) {
+    this.entries = items.map((item) => ({
+      item,
+      status: "pending"
+    }));
+    this.live = process.stdout.isTTY === true && process.env.CI !== "true";
+  }
+
+  start(): void {
+    if (!this.live) {
+      console.log(
+        chalk.gray(
+          `${this.dryRun ? "dry-run" : "clean"} 실행: ${this.entries.length}개 작업, 예상 회수 ${formatBytes(
+            sumKnownBytes(this.entries.map((entry) => entry.item))
+          )}`
+        )
+      );
+      return;
+    }
+
+    process.stdout.write("\x1B[?25l");
+    this.render();
+    this.startTimer();
+  }
+
+  startItem(item: CleanableItem, options?: { silent?: boolean }): void {
+    const entry = this.findEntry(item);
+    entry.status = "running";
+    entry.startedAt = Date.now();
+    entry.finishedAt = undefined;
+    entry.result = undefined;
+
+    if (!this.live) {
+      const index = this.entries.indexOf(entry) + 1;
+      console.log(chalk.cyan(`[${index}/${this.entries.length}] 실행 중: ${item.label}`));
+      return;
+    }
+
+    if (!this.suspended && options?.silent !== true) {
+      this.render();
+    }
+  }
+
+  finishItem(item: CleanableItem, result: ExecuteResult): void {
+    const entry = this.findEntry(item);
+    entry.status = result.success ? "success" : "failed";
+    entry.result = result;
+    entry.finishedAt = Date.now();
+
+    if (!this.live) {
+      const index = this.entries.indexOf(entry) + 1;
+      const status = result.success ? chalk.green("완료") : chalk.red("실패");
+      console.log(
+        `${status} [${index}/${this.entries.length}] ${item.label}: ${result.message} ${chalk.gray(
+          formatBytes(result.reclaimedBytes)
+        )}`
+      );
+      return;
+    }
+
+    if (!this.suspended) {
+      this.render();
+    }
+  }
+
+  suspendForExternalPrompt(): void {
+    if (!this.live || this.suspended) {
+      return;
+    }
+
+    this.stopTimer();
+    this.clearRendered();
+    this.suspended = true;
+    process.stdout.write("\x1B[?25h");
+    console.log(chalk.yellow("sudo 권한 요청이 표시되면 터미널에서 승인/암호 입력을 완료하세요."));
+  }
+
+  resumeAfterExternalPrompt(): void {
+    if (!this.live || !this.suspended) {
+      return;
+    }
+
+    this.suspended = false;
+    process.stdout.write("\x1B[?25l");
+    this.render();
+    this.startTimer();
+  }
+
+  stop(): void {
+    if (!this.live) {
+      return;
+    }
+
+    this.stopTimer();
+    if (this.suspended) {
+      this.suspended = false;
+      process.stdout.write("\x1B[?25l");
+    }
+    this.render();
+    process.stdout.write("\x1B[?25h");
+  }
+
+  private findEntry(item: CleanableItem): ExecutionProgressEntry {
+    const entry = this.entries.find((candidate) => candidate.item.id === item.id);
+    if (!entry) {
+      throw new Error(`실행 진행 상태를 찾을 수 없습니다: ${item.id}`);
+    }
+
+    return entry;
+  }
+
+  private startTimer(): void {
+    if (this.timer !== null) {
+      return;
+    }
+
+    this.timer = setInterval(() => {
+      this.render();
+    }, PROGRESS_REFRESH_MS);
+  }
+
+  private stopTimer(): void {
+    if (this.timer === null) {
+      return;
+    }
+
+    clearInterval(this.timer);
+    this.timer = null;
+  }
+
+  private clearRendered(): void {
+    for (let index = 0; index < this.lineCount; index += 1) {
+      process.stdout.write("\x1B[1A\x1B[2K");
+    }
+    process.stdout.write("\r\x1B[2K");
+    this.lineCount = 0;
+  }
+
+  private render(): void {
+    if (!this.live || this.suspended) {
+      return;
+    }
+
+    this.clearRendered();
+    const lines = renderCleanProgress(this.entries, this.dryRun, this.startedAt, Date.now());
+    process.stdout.write(`${lines.join("\n")}\n`);
+    this.lineCount = lines.length;
+  }
+}
+
 async function executeItems(items: CleanableItem[], dryRun: boolean): Promise<ExecutionRecord[]> {
   const records: ExecutionRecord[] = [];
   const historyEntries: HistoryEntry[] = [];
+  const progress = new CleanProgressRenderer(items, dryRun);
 
-  for (const item of items) {
-    const spinner = ora(`${item.label} 실행 중...`).start();
-    let result: ExecuteResult;
+  progress.start();
+  try {
+    for (const item of items) {
+      const shouldSuspendForPrompt = item.requiresSudo && !dryRun;
+      let result: ExecuteResult;
 
-    try {
-      result = await item.execute({ dryRun });
-    } catch (error) {
-      result = {
-        success: false,
-        reclaimedBytes: null,
-        message: error instanceof Error ? error.message : String(error)
-      };
+      progress.startItem(item, { silent: shouldSuspendForPrompt });
+
+      if (shouldSuspendForPrompt) {
+        progress.suspendForExternalPrompt();
+      }
+
+      try {
+        result = await item.execute({ dryRun });
+      } catch (error) {
+        result = {
+          success: false,
+          reclaimedBytes: null,
+          message: error instanceof Error ? error.message : String(error)
+        };
+      } finally {
+        if (shouldSuspendForPrompt) {
+          progress.resumeAfterExternalPrompt();
+        }
+      }
+
+      progress.finishItem(item, result);
+      records.push({ item, result });
+      historyEntries.push(makeHistoryEntry(item, result, dryRun));
     }
-
-    if (result.success) {
-      spinner.succeed(`${item.label}: ${result.message}`);
-    } else {
-      spinner.fail(`${item.label}: ${result.message}`);
-    }
-
-    records.push({ item, result });
-    historyEntries.push(makeHistoryEntry(item, result, dryRun));
+  } finally {
+    progress.stop();
   }
 
   try {

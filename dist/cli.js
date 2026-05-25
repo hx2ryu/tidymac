@@ -42409,6 +42409,7 @@ var SCANNERS = {
 };
 var PANEL_MAX_WIDTH = 108;
 var PANEL_MIN_WIDTH = 72;
+var MIN_TERMINAL_WIDTH = 40;
 function ensureDarwin() {
   if (platform2() !== "darwin") {
     console.error(source_default.red("tidymac\uC740 macOS\uC5D0\uC11C\uB9CC \uC2E4\uD589\uD560 \uC218 \uC788\uC2B5\uB2C8\uB2E4."));
@@ -42434,8 +42435,11 @@ function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
 }
 function terminalWidth() {
-  const columns = process.stdout.columns ?? 96;
-  return Math.round(clamp(columns, PANEL_MIN_WIDTH, PANEL_MAX_WIDTH));
+  const columns = process.stdout.columns;
+  if (columns === void 0) {
+    return Math.round(clamp(96, PANEL_MIN_WIDTH, PANEL_MAX_WIDTH));
+  }
+  return Math.round(clamp(columns, Math.min(columns, MIN_TERMINAL_WIDTH), Math.min(columns, PANEL_MAX_WIDTH)));
 }
 function visiblePadEnd(input, width) {
   const remaining = width - stringWidth2(input);
@@ -42446,30 +42450,56 @@ function visiblePadStart(input, width) {
   return remaining > 0 ? `${" ".repeat(remaining)}${input}` : input;
 }
 function truncateText(input, maxWidth) {
+  if (maxWidth <= 0) {
+    return "";
+  }
   if (stringWidth2(input) <= maxWidth) {
     return input;
   }
+  const ellipsis = "\u2026";
+  const ansiPattern = /^\x1B\[[0-?]*[ -/]*[@-~]/;
   let output = "";
-  for (const char of input) {
-    if (stringWidth2(`${output}${char}\u2026`) > maxWidth) {
+  let visibleWidth = 0;
+  let index = 0;
+  while (index < input.length) {
+    const sequence = input.slice(index).match(ansiPattern)?.[0];
+    if (sequence) {
+      output += sequence;
+      index += sequence.length;
+      continue;
+    }
+    const codePoint = input.codePointAt(index);
+    if (codePoint === void 0) {
       break;
     }
+    const char = String.fromCodePoint(codePoint);
+    const nextWidth = visibleWidth + stringWidth2(char);
+    if (nextWidth + stringWidth2(ellipsis) > maxWidth) {
+      break;
+    }
+    visibleWidth = nextWidth;
     output += char;
+    index += char.length;
   }
-  return `${output}\u2026`;
+  return `${output}\x1B[0m${ellipsis}`;
 }
-function printBox(title, lines, options) {
+function renderBoxLines(title, lines, options) {
   const width = options?.width ?? terminalWidth();
   const color = options?.color ?? source_default.gray;
   const innerWidth = Math.max(20, width - 4);
-  const titleText = title ? ` ${title} ` : "";
+  const titleText = title ? truncateText(` ${title} `, Math.max(0, width - 3)) : "";
   const topFillWidth = titleText ? Math.max(0, width - stringWidth2(titleText) - 3) : width - 2;
   const top = titleText ? `${color("\u256D")}${color("\u2500")}${source_default.bold(titleText)}${color("\u2500".repeat(topFillWidth))}${color("\u256E")}` : `${color("\u256D")}${color("\u2500".repeat(width - 2))}${color("\u256E")}`;
-  console.log(top);
+  const renderedLines = [top];
   for (const line of lines) {
-    console.log(`${color("\u2502")} ${visiblePadEnd(line, innerWidth)} ${color("\u2502")}`);
+    const content = truncateText(line, innerWidth);
+    renderedLines.push(`${color("\u2502")} ${visiblePadEnd(content, innerWidth)} ${color("\u2502")}`);
   }
-  console.log(`${color("\u2570")}${color("\u2500".repeat(width - 2))}${color("\u256F")}`);
+  renderedLines.push(`${color("\u2570")}${color("\u2500".repeat(width - 2))}${color("\u256F")}`);
+  return renderedLines;
+}
+function printBox(title, lines, options) {
+  console.log(renderBoxLines(title, lines, options).join("\n"));
 }
 function printSpacer() {
   console.log("");
@@ -42518,6 +42548,23 @@ function renderNeutralGauge(value, options) {
 }
 function renderUnknownGauge(width = 24) {
   return source_default.gray("\u2591".repeat(width));
+}
+function formatDuration(milliseconds) {
+  const totalSeconds = Math.max(0, Math.round(milliseconds / 1e3));
+  if (totalSeconds === 0) {
+    return "0\uCD08";
+  }
+  if (totalSeconds < 60) {
+    return `${totalSeconds}\uCD08`;
+  }
+  const totalMinutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (totalMinutes < 60) {
+    return `${totalMinutes}\uBD84 ${seconds.toString().padStart(2, "0")}\uCD08`;
+  }
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  return `${hours}\uC2DC\uAC04 ${minutes.toString().padStart(2, "0")}\uBD84`;
 }
 function ratioOrNull(used, total) {
   if (used === null || total === null || total <= 0) {
@@ -42758,28 +42805,318 @@ function makeHistoryEntry(item, result, dryRun) {
     message: result.message
   };
 }
+var PROGRESS_REFRESH_MS = 250;
+var PROGRESS_LIST_LIMIT = 6;
+function isCompletedProgress(entry) {
+  return entry.status === "success" || entry.status === "failed";
+}
+function progressSymbol(status) {
+  if (status === "running") {
+    return source_default.cyan("\u25B6");
+  }
+  if (status === "success") {
+    return source_default.green("\u2713");
+  }
+  if (status === "failed") {
+    return source_default.red("\u2717");
+  }
+  return source_default.gray("\u2022");
+}
+function progressItemLabel(item) {
+  return `${CATEGORY_LABELS[item.category]} \xB7 ${item.requiresSudo ? "[sudo] " : ""}${item.label}`;
+}
+function progressEntryDuration(entry, now) {
+  if (entry.startedAt === void 0) {
+    return null;
+  }
+  return formatDuration((entry.finishedAt ?? now) - entry.startedAt);
+}
+function formatProgressEntry(entry, now, innerWidth) {
+  const symbol = progressSymbol(entry.status);
+  const label = progressItemLabel(entry.item);
+  const bytes = entry.result ? entry.result.reclaimedBytes : entry.item.reclaimableBytes;
+  const duration = progressEntryDuration(entry, now);
+  const statusText = entry.status === "failed" ? source_default.red("\uC2E4\uD328") : entry.status === "success" ? source_default.green("\uC644\uB8CC") : entry.status === "running" ? source_default.cyan("\uC9C4\uD589") : source_default.gray("\uB300\uAE30");
+  const right2 = [statusText, source_default.gray(formatBytes(bytes)), duration ? source_default.gray(duration) : null].filter((part) => part !== null).join(source_default.gray(" \xB7 "));
+  const prefix = `${symbol} `;
+  const maxLabelWidth = Math.max(8, innerWidth - stringWidth2(prefix) - stringWidth2(right2) - 2);
+  const left2 = `${prefix}${truncateText(label, maxLabelWidth)}`;
+  const gapWidth = Math.max(1, innerWidth - stringWidth2(left2) - stringWidth2(right2));
+  return `${left2}${" ".repeat(gapWidth)}${right2}`;
+}
+function averageCompletedDuration(entries) {
+  const durations = entries.filter(isCompletedProgress).map(
+    (entry) => entry.startedAt !== void 0 && entry.finishedAt !== void 0 ? entry.finishedAt - entry.startedAt : null
+  ).filter((duration) => duration !== null && duration > 0);
+  if (durations.length === 0) {
+    return null;
+  }
+  return durations.reduce((sum, duration) => sum + duration, 0) / durations.length;
+}
+function estimateRemainingDuration(entries, runningEntry, pendingCount, now) {
+  if (entries.every(isCompletedProgress)) {
+    return 0;
+  }
+  const averageDuration = averageCompletedDuration(entries);
+  if (averageDuration === null) {
+    return null;
+  }
+  const runningElapsed = runningEntry?.startedAt === void 0 ? 0 : Math.max(0, now - runningEntry.startedAt);
+  const runningRemaining = runningEntry ? Math.max(averageDuration - runningElapsed, averageDuration * 0.25) : 0;
+  return runningRemaining + pendingCount * averageDuration;
+}
+function estimateProgressRatio(entries, runningEntry, now) {
+  if (entries.length === 0) {
+    return 1;
+  }
+  const completedCount = entries.filter(isCompletedProgress).length;
+  const averageDuration = averageCompletedDuration(entries);
+  const runningElapsed = runningEntry?.startedAt === void 0 ? 0 : Math.max(0, now - runningEntry.startedAt);
+  const runningFraction = runningEntry === void 0 ? 0 : averageDuration === null ? 0.1 : clamp(runningElapsed / averageDuration, 0.05, 0.95);
+  return clamp((completedCount + runningFraction) / entries.length, 0, 1);
+}
+function renderCleanProgress(entries, dryRun, startedAt, now) {
+  const boxWidth = terminalWidth();
+  const innerWidth = boxWidth - 4;
+  const completedEntries = entries.filter(isCompletedProgress);
+  const runningEntry = entries.find((entry) => entry.status === "running");
+  const pendingEntries = entries.filter((entry) => entry.status === "pending");
+  const failures = completedEntries.filter((entry) => entry.status === "failed").length;
+  const remainingCount = pendingEntries.length + (runningEntry ? 1 : 0);
+  const progressRatio = estimateProgressRatio(entries, runningEntry, now);
+  const eta = estimateRemainingDuration(entries, runningEntry, pendingEntries.length, now);
+  const plannedItems = entries.map((entry) => entry.item);
+  const totalKnown = sumKnownBytes(plannedItems);
+  const totalUnknown = countUnknownBytes(plannedItems);
+  const reclaimedKnown = sumKnownBytes(completedEntries.map((entry) => entry.result ?? { reclaimedBytes: 0 }));
+  const reclaimedUnknown = completedEntries.filter((entry) => entry.result?.reclaimedBytes === null).length;
+  const completedLabel = `${completedEntries.length}/${entries.length}`;
+  const failureLabel = failures > 0 ? source_default.red(`${failures}`) : `${failures}`;
+  const modeLabel = dryRun ? source_default.cyan("dry-run") : source_default.green("\uC2E4\uD589");
+  const gaugeColor = failures > 0 ? source_default.yellow : dryRun ? source_default.cyan : source_default.green;
+  const lines = [
+    `${source_default.gray("\uBAA8\uB4DC")} ${modeLabel}   ${source_default.gray("\uC644\uB8CC")} ${source_default.bold(
+      completedLabel
+    )}   ${source_default.gray("\uB0A8\uC74C")} ${remainingCount}   ${source_default.gray("\uC2E4\uD328")} ${failureLabel}`,
+    `${source_default.gray("\uC9C4\uD589\uB960")} ${renderNeutralGauge(progressRatio, {
+      width: 18,
+      color: gaugeColor
+    })} ${visiblePadStart(formatPercent(progressRatio), 4)}   ${source_default.gray("\uACBD\uACFC")} ${formatDuration(
+      now - startedAt
+    )}   ${source_default.gray("\uC608\uC0C1 \uB0A8\uC740")} ${eta === null ? source_default.gray("\uACC4\uC0B0 \uC911") : formatDuration(eta)}`,
+    dryRun ? `${source_default.gray("\uC608\uC0C1 \uD68C\uC218")} ${formatBytes(totalKnown)}${totalUnknown > 0 ? source_default.gray(`   \uD06C\uAE30 \uBBF8\uD655\uC815 ${totalUnknown}\uAC1C`) : ""}` : `${source_default.gray("\uD68C\uC218")} ${formatBytes(reclaimedKnown)}${reclaimedUnknown > 0 ? source_default.gray(`   \uD06C\uAE30 \uBBF8\uD655\uC815 ${reclaimedUnknown}\uAC1C`) : ""}   ${source_default.gray("\uC608\uC0C1")} ${formatBytes(totalKnown)}${totalUnknown > 0 ? source_default.gray(`   \uBBF8\uD655\uC815 ${totalUnknown}\uAC1C`) : ""}`
+  ];
+  lines.push("");
+  if (runningEntry) {
+    lines.push(source_default.bold("\uC9C4\uD589 \uC911"));
+    lines.push(formatProgressEntry(runningEntry, now, innerWidth));
+    lines.push(source_default.gray(`  ${truncateText(runningEntry.item.description, innerWidth - 2)}`));
+  } else {
+    lines.push(`${source_default.bold("\uC9C4\uD589 \uC911")} ${source_default.gray("\uC5C6\uC74C")}`);
+  }
+  lines.push("");
+  lines.push(source_default.bold(`\uC644\uB8CC\uB41C \uC791\uC5C5 ${completedEntries.length}\uAC1C`));
+  if (completedEntries.length === 0) {
+    lines.push(source_default.gray("  \uC544\uC9C1 \uC644\uB8CC\uB41C \uC791\uC5C5\uC774 \uC5C6\uC2B5\uB2C8\uB2E4."));
+  } else {
+    const visibleCompleted = completedEntries.slice(-PROGRESS_LIST_LIMIT);
+    const hiddenCompletedCount = completedEntries.length - visibleCompleted.length;
+    if (hiddenCompletedCount > 0) {
+      lines.push(source_default.gray(`  \uC774\uC804 \uC644\uB8CC ${hiddenCompletedCount}\uAC1C \uC0DD\uB7B5`));
+    }
+    for (const entry of visibleCompleted) {
+      lines.push(formatProgressEntry(entry, now, innerWidth));
+      if (entry.status === "failed" && entry.result) {
+        lines.push(source_default.red(`  ${truncateText(entry.result.message, innerWidth - 2)}`));
+      }
+    }
+  }
+  lines.push("");
+  lines.push(source_default.bold(`\uB0A8\uC740 \uC791\uC5C5 ${pendingEntries.length}\uAC1C`));
+  if (pendingEntries.length === 0) {
+    lines.push(source_default.gray("  \uB300\uAE30 \uC911\uC778 \uC791\uC5C5\uC774 \uC5C6\uC2B5\uB2C8\uB2E4."));
+  } else {
+    const visiblePending = pendingEntries.slice(0, PROGRESS_LIST_LIMIT);
+    for (const entry of visiblePending) {
+      lines.push(formatProgressEntry(entry, now, innerWidth));
+    }
+    if (pendingEntries.length > visiblePending.length) {
+      lines.push(source_default.gray(`  \uC774\uD6C4 \uC791\uC5C5 ${pendingEntries.length - visiblePending.length}\uAC1C \uB354 \uC788\uC74C`));
+    }
+  }
+  return renderBoxLines(dryRun ? "tidymac dry-run \uC9C4\uD589" : "tidymac clean \uC9C4\uD589", lines, {
+    color: failures > 0 ? source_default.yellow : dryRun ? source_default.cyan : source_default.green,
+    width: boxWidth
+  });
+}
+var CleanProgressRenderer = class {
+  constructor(items, dryRun) {
+    this.dryRun = dryRun;
+    this.entries = items.map((item) => ({
+      item,
+      status: "pending"
+    }));
+    this.live = process.stdout.isTTY === true && process.env.CI !== "true";
+  }
+  dryRun;
+  entries;
+  live;
+  startedAt = Date.now();
+  timer = null;
+  lineCount = 0;
+  suspended = false;
+  start() {
+    if (!this.live) {
+      console.log(
+        source_default.gray(
+          `${this.dryRun ? "dry-run" : "clean"} \uC2E4\uD589: ${this.entries.length}\uAC1C \uC791\uC5C5, \uC608\uC0C1 \uD68C\uC218 ${formatBytes(
+            sumKnownBytes(this.entries.map((entry) => entry.item))
+          )}`
+        )
+      );
+      return;
+    }
+    process.stdout.write("\x1B[?25l");
+    this.render();
+    this.startTimer();
+  }
+  startItem(item, options) {
+    const entry = this.findEntry(item);
+    entry.status = "running";
+    entry.startedAt = Date.now();
+    entry.finishedAt = void 0;
+    entry.result = void 0;
+    if (!this.live) {
+      const index = this.entries.indexOf(entry) + 1;
+      console.log(source_default.cyan(`[${index}/${this.entries.length}] \uC2E4\uD589 \uC911: ${item.label}`));
+      return;
+    }
+    if (!this.suspended && options?.silent !== true) {
+      this.render();
+    }
+  }
+  finishItem(item, result) {
+    const entry = this.findEntry(item);
+    entry.status = result.success ? "success" : "failed";
+    entry.result = result;
+    entry.finishedAt = Date.now();
+    if (!this.live) {
+      const index = this.entries.indexOf(entry) + 1;
+      const status = result.success ? source_default.green("\uC644\uB8CC") : source_default.red("\uC2E4\uD328");
+      console.log(
+        `${status} [${index}/${this.entries.length}] ${item.label}: ${result.message} ${source_default.gray(
+          formatBytes(result.reclaimedBytes)
+        )}`
+      );
+      return;
+    }
+    if (!this.suspended) {
+      this.render();
+    }
+  }
+  suspendForExternalPrompt() {
+    if (!this.live || this.suspended) {
+      return;
+    }
+    this.stopTimer();
+    this.clearRendered();
+    this.suspended = true;
+    process.stdout.write("\x1B[?25h");
+    console.log(source_default.yellow("sudo \uAD8C\uD55C \uC694\uCCAD\uC774 \uD45C\uC2DC\uB418\uBA74 \uD130\uBBF8\uB110\uC5D0\uC11C \uC2B9\uC778/\uC554\uD638 \uC785\uB825\uC744 \uC644\uB8CC\uD558\uC138\uC694."));
+  }
+  resumeAfterExternalPrompt() {
+    if (!this.live || !this.suspended) {
+      return;
+    }
+    this.suspended = false;
+    process.stdout.write("\x1B[?25l");
+    this.render();
+    this.startTimer();
+  }
+  stop() {
+    if (!this.live) {
+      return;
+    }
+    this.stopTimer();
+    if (this.suspended) {
+      this.suspended = false;
+      process.stdout.write("\x1B[?25l");
+    }
+    this.render();
+    process.stdout.write("\x1B[?25h");
+  }
+  findEntry(item) {
+    const entry = this.entries.find((candidate) => candidate.item.id === item.id);
+    if (!entry) {
+      throw new Error(`\uC2E4\uD589 \uC9C4\uD589 \uC0C1\uD0DC\uB97C \uCC3E\uC744 \uC218 \uC5C6\uC2B5\uB2C8\uB2E4: ${item.id}`);
+    }
+    return entry;
+  }
+  startTimer() {
+    if (this.timer !== null) {
+      return;
+    }
+    this.timer = setInterval(() => {
+      this.render();
+    }, PROGRESS_REFRESH_MS);
+  }
+  stopTimer() {
+    if (this.timer === null) {
+      return;
+    }
+    clearInterval(this.timer);
+    this.timer = null;
+  }
+  clearRendered() {
+    for (let index = 0; index < this.lineCount; index += 1) {
+      process.stdout.write("\x1B[1A\x1B[2K");
+    }
+    process.stdout.write("\r\x1B[2K");
+    this.lineCount = 0;
+  }
+  render() {
+    if (!this.live || this.suspended) {
+      return;
+    }
+    this.clearRendered();
+    const lines = renderCleanProgress(this.entries, this.dryRun, this.startedAt, Date.now());
+    process.stdout.write(`${lines.join("\n")}
+`);
+    this.lineCount = lines.length;
+  }
+};
 async function executeItems(items, dryRun) {
   const records = [];
   const historyEntries = [];
-  for (const item of items) {
-    const spinner = ora2(`${item.label} \uC2E4\uD589 \uC911...`).start();
-    let result;
-    try {
-      result = await item.execute({ dryRun });
-    } catch (error) {
-      result = {
-        success: false,
-        reclaimedBytes: null,
-        message: error instanceof Error ? error.message : String(error)
-      };
+  const progress = new CleanProgressRenderer(items, dryRun);
+  progress.start();
+  try {
+    for (const item of items) {
+      const shouldSuspendForPrompt = item.requiresSudo && !dryRun;
+      let result;
+      progress.startItem(item, { silent: shouldSuspendForPrompt });
+      if (shouldSuspendForPrompt) {
+        progress.suspendForExternalPrompt();
+      }
+      try {
+        result = await item.execute({ dryRun });
+      } catch (error) {
+        result = {
+          success: false,
+          reclaimedBytes: null,
+          message: error instanceof Error ? error.message : String(error)
+        };
+      } finally {
+        if (shouldSuspendForPrompt) {
+          progress.resumeAfterExternalPrompt();
+        }
+      }
+      progress.finishItem(item, result);
+      records.push({ item, result });
+      historyEntries.push(makeHistoryEntry(item, result, dryRun));
     }
-    if (result.success) {
-      spinner.succeed(`${item.label}: ${result.message}`);
-    } else {
-      spinner.fail(`${item.label}: ${result.message}`);
-    }
-    records.push({ item, result });
-    historyEntries.push(makeHistoryEntry(item, result, dryRun));
+  } finally {
+    progress.stop();
   }
   try {
     await appendHistoryEntries(historyEntries);
