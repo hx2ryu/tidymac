@@ -14,6 +14,19 @@ const ALLOWED_ROOTS = [
   "/private/var/tmp"
 ];
 
+export interface DirectoryCleanupFailure {
+  path: string;
+  code: string | null;
+  message: string;
+}
+
+export interface DirectoryCleanupResult {
+  attemptedEntries: number;
+  removedEntries: number;
+  skippedEntries: number;
+  failures: DirectoryCleanupFailure[];
+}
+
 export function expandHome(input: string): string {
   if (input === "~") {
     return homedir();
@@ -98,7 +111,42 @@ export async function getExistingDirectorySize(paths: string[]): Promise<number>
   return sizes.reduce((sum, size) => sum + size, 0);
 }
 
-export async function emptyDirectoryContents(input: string): Promise<void> {
+function getErrorCode(error: unknown): string | null {
+  if (typeof error !== "object" || error === null || !("code" in error)) {
+    return null;
+  }
+
+  const code = (error as { code?: unknown }).code;
+  return typeof code === "string" ? code : null;
+}
+
+function getErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+async function removeDirectoryEntry(path: string): Promise<DirectoryCleanupFailure | null> {
+  try {
+    await rm(path, {
+      force: true,
+      recursive: true,
+      maxRetries: 2
+    });
+    return null;
+  } catch (error) {
+    const code = getErrorCode(error);
+    if (code === "ENOENT") {
+      return null;
+    }
+
+    return {
+      path,
+      code,
+      message: getErrorMessage(error)
+    };
+  }
+}
+
+export async function emptyDirectoryContents(input: string): Promise<DirectoryCleanupResult> {
   const expanded = expandHome(input);
 
   if (!isSafeUserPath(expanded)) {
@@ -106,19 +154,25 @@ export async function emptyDirectoryContents(input: string): Promise<void> {
   }
 
   if (!(await isDirectory(expanded))) {
-    return;
+    return {
+      attemptedEntries: 0,
+      removedEntries: 0,
+      skippedEntries: 0,
+      failures: []
+    };
   }
 
   const entries = await readdir(expanded, { withFileTypes: true });
-  await Promise.all(
-    entries.map((entry) =>
-      rm(join(expanded, entry.name), {
-        force: true,
-        recursive: true,
-        maxRetries: 2
-      })
-    )
-  );
+  const failures = (
+    await Promise.all(entries.map((entry) => removeDirectoryEntry(join(expanded, entry.name))))
+  ).filter((failure): failure is DirectoryCleanupFailure => failure !== null);
+
+  return {
+    attemptedEntries: entries.length,
+    removedEntries: entries.length - failures.length,
+    skippedEntries: failures.length,
+    failures
+  };
 }
 
 export async function removeSafePath(input: string): Promise<void> {

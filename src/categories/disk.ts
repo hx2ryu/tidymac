@@ -6,7 +6,8 @@ import {
   getExistingDirectorySize,
   isDirectory,
   isSafeUserPath,
-  pathExists
+  pathExists,
+  type DirectoryCleanupResult
 } from "../lib/fs.js";
 import type { CleanableItem, ExecuteResult, RiskLevel, ScanResult } from "../lib/types.js";
 
@@ -69,6 +70,49 @@ async function existingDirectories(paths: string[]): Promise<string[]> {
   return checks.filter((check) => check.exists).map((check) => check.path);
 }
 
+function combineCleanupResults(results: DirectoryCleanupResult[]): DirectoryCleanupResult {
+  return results.reduce<DirectoryCleanupResult>(
+    (combined, result) => ({
+      attemptedEntries: combined.attemptedEntries + result.attemptedEntries,
+      removedEntries: combined.removedEntries + result.removedEntries,
+      skippedEntries: combined.skippedEntries + result.skippedEntries,
+      failures: [...combined.failures, ...result.failures]
+    }),
+    {
+      attemptedEntries: 0,
+      removedEntries: 0,
+      skippedEntries: 0,
+      failures: []
+    }
+  );
+}
+
+function formatCleanupFailureSamples(failures: DirectoryCleanupResult["failures"]): string {
+  const samples = failures.slice(0, 3).map((failure) => {
+    const code = failure.code === null ? "" : ` (${failure.code})`;
+    return `${failure.path}${code}`;
+  });
+
+  if (samples.length === 0) {
+    return "";
+  }
+
+  const remaining = failures.length - samples.length;
+  return remaining > 0 ? `${samples.join(", ")} 외 ${remaining}개` : samples.join(", ");
+}
+
+function formatDirectoryCleanupMessage(paths: string[], result: DirectoryCleanupResult): string {
+  const base = `${paths.length}개 디렉터리의 내용을 정리했습니다.`;
+  if (result.skippedEntries === 0) {
+    return base;
+  }
+
+  const samples = formatCleanupFailureSamples(result.failures);
+  return `${base} ${result.skippedEntries}개 항목은 권한/사용 중이라 건너뛰었습니다${
+    samples ? `: ${samples}` : ""
+  }.`;
+}
+
 async function makeDirectoryGroupItem(group: DirectoryGroup): Promise<CleanableItem | null> {
   const paths = await existingDirectories(group.paths);
   if (paths.length === 0) {
@@ -101,15 +145,15 @@ async function makeDirectoryGroupItem(group: DirectoryGroup): Promise<CleanableI
       }
 
       const before = await getExistingDirectorySize(paths);
-      for (const path of paths) {
-        await emptyDirectoryContents(path);
-      }
+      const cleanupResult = combineCleanupResults(
+        await Promise.all(paths.map((path) => emptyDirectoryContents(path)))
+      );
       const after = await getExistingDirectorySize(paths);
 
       return {
-        success: true,
+        success: cleanupResult.skippedEntries === 0 || cleanupResult.removedEntries > 0,
         reclaimedBytes: Math.max(0, before - after),
-        message: `${paths.length}개 디렉터리의 내용을 정리했습니다.`
+        message: formatDirectoryCleanupMessage(paths, cleanupResult)
       };
     }
   };
@@ -252,15 +296,17 @@ async function scanMetroCaches(): Promise<CleanableItem | null> {
       }
 
       const before = await getExistingDirectorySize(paths);
-      for (const path of paths) {
-        await emptyDirectoryContents(path);
-      }
+      const cleanupResult = combineCleanupResults(
+        await Promise.all(paths.map((path) => emptyDirectoryContents(path)))
+      );
       const after = await getExistingDirectorySize(paths);
 
       return {
-        success: true,
+        success: cleanupResult.skippedEntries === 0 || cleanupResult.removedEntries > 0,
         reclaimedBytes: Math.max(0, before - after),
-        message: `${paths.length}개 Metro 캐시 디렉터리를 정리했습니다.`
+        message: cleanupResult.skippedEntries === 0
+          ? `${paths.length}개 Metro 캐시 디렉터리를 정리했습니다.`
+          : formatDirectoryCleanupMessage(paths, cleanupResult)
       };
     }
   };

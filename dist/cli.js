@@ -2598,7 +2598,7 @@ Expecting one of '${allowedValues.join("', '")}'`);
           }
           return positiveOption || option2;
         };
-        const getErrorMessage = (option2) => {
+        const getErrorMessage2 = (option2) => {
           const bestOption = findBestOptionFromValue(option2);
           const optionKey = bestOption.attributeName();
           const source = this.getOptionValueSource(optionKey);
@@ -2607,7 +2607,7 @@ Expecting one of '${allowedValues.join("', '")}'`);
           }
           return `option '${bestOption.flags}'`;
         };
-        const message = `error: ${getErrorMessage(option)} cannot be used with ${getErrorMessage(conflictingOption)}`;
+        const message = `error: ${getErrorMessage2(option)} cannot be used with ${getErrorMessage2(conflictingOption)}`;
         this.error(message, { code: "commander.conflictingOption" });
       }
       /**
@@ -41553,24 +41553,57 @@ async function getExistingDirectorySize(paths) {
   const sizes = await Promise.all(paths.map((path8) => getDirectorySize(path8)));
   return sizes.reduce((sum, size) => sum + size, 0);
 }
+function getErrorCode(error) {
+  if (typeof error !== "object" || error === null || !("code" in error)) {
+    return null;
+  }
+  const code = error.code;
+  return typeof code === "string" ? code : null;
+}
+function getErrorMessage(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+async function removeDirectoryEntry(path8) {
+  try {
+    await rm(path8, {
+      force: true,
+      recursive: true,
+      maxRetries: 2
+    });
+    return null;
+  } catch (error) {
+    const code = getErrorCode(error);
+    if (code === "ENOENT") {
+      return null;
+    }
+    return {
+      path: path8,
+      code,
+      message: getErrorMessage(error)
+    };
+  }
+}
 async function emptyDirectoryContents(input) {
   const expanded = expandHome(input);
   if (!isSafeUserPath(expanded)) {
     throw new Error(`\uC548\uC804\uD558\uC9C0 \uC54A\uC740 \uACBD\uB85C\uB77C\uC11C \uC815\uB9AC\uD558\uC9C0 \uC54A\uC558\uC2B5\uB2C8\uB2E4: ${expanded}`);
   }
   if (!await isDirectory(expanded)) {
-    return;
+    return {
+      attemptedEntries: 0,
+      removedEntries: 0,
+      skippedEntries: 0,
+      failures: []
+    };
   }
   const entries = await readdir(expanded, { withFileTypes: true });
-  await Promise.all(
-    entries.map(
-      (entry) => rm(join(expanded, entry.name), {
-        force: true,
-        recursive: true,
-        maxRetries: 2
-      })
-    )
-  );
+  const failures = (await Promise.all(entries.map((entry) => removeDirectoryEntry(join(expanded, entry.name))))).filter((failure) => failure !== null);
+  return {
+    attemptedEntries: entries.length,
+    removedEntries: entries.length - failures.length,
+    skippedEntries: failures.length,
+    failures
+  };
 }
 
 // src/categories/disk.ts
@@ -41618,6 +41651,41 @@ async function existingDirectories(paths) {
   );
   return checks.filter((check) => check.exists).map((check) => check.path);
 }
+function combineCleanupResults(results) {
+  return results.reduce(
+    (combined, result) => ({
+      attemptedEntries: combined.attemptedEntries + result.attemptedEntries,
+      removedEntries: combined.removedEntries + result.removedEntries,
+      skippedEntries: combined.skippedEntries + result.skippedEntries,
+      failures: [...combined.failures, ...result.failures]
+    }),
+    {
+      attemptedEntries: 0,
+      removedEntries: 0,
+      skippedEntries: 0,
+      failures: []
+    }
+  );
+}
+function formatCleanupFailureSamples(failures) {
+  const samples = failures.slice(0, 3).map((failure) => {
+    const code = failure.code === null ? "" : ` (${failure.code})`;
+    return `${failure.path}${code}`;
+  });
+  if (samples.length === 0) {
+    return "";
+  }
+  const remaining = failures.length - samples.length;
+  return remaining > 0 ? `${samples.join(", ")} \uC678 ${remaining}\uAC1C` : samples.join(", ");
+}
+function formatDirectoryCleanupMessage(paths, result) {
+  const base = `${paths.length}\uAC1C \uB514\uB809\uD130\uB9AC\uC758 \uB0B4\uC6A9\uC744 \uC815\uB9AC\uD588\uC2B5\uB2C8\uB2E4.`;
+  if (result.skippedEntries === 0) {
+    return base;
+  }
+  const samples = formatCleanupFailureSamples(result.failures);
+  return `${base} ${result.skippedEntries}\uAC1C \uD56D\uBAA9\uC740 \uAD8C\uD55C/\uC0AC\uC6A9 \uC911\uC774\uB77C \uAC74\uB108\uB6F0\uC5C8\uC2B5\uB2C8\uB2E4${samples ? `: ${samples}` : ""}.`;
+}
 async function makeDirectoryGroupItem(group) {
   const paths = await existingDirectories(group.paths);
   if (paths.length === 0) {
@@ -41647,14 +41715,14 @@ async function makeDirectoryGroupItem(group) {
         };
       }
       const before = await getExistingDirectorySize(paths);
-      for (const path8 of paths) {
-        await emptyDirectoryContents(path8);
-      }
+      const cleanupResult = combineCleanupResults(
+        await Promise.all(paths.map((path8) => emptyDirectoryContents(path8)))
+      );
       const after = await getExistingDirectorySize(paths);
       return {
-        success: true,
+        success: cleanupResult.skippedEntries === 0 || cleanupResult.removedEntries > 0,
         reclaimedBytes: Math.max(0, before - after),
-        message: `${paths.length}\uAC1C \uB514\uB809\uD130\uB9AC\uC758 \uB0B4\uC6A9\uC744 \uC815\uB9AC\uD588\uC2B5\uB2C8\uB2E4.`
+        message: formatDirectoryCleanupMessage(paths, cleanupResult)
       };
     }
   };
@@ -41773,14 +41841,14 @@ async function scanMetroCaches() {
         };
       }
       const before = await getExistingDirectorySize(paths);
-      for (const path8 of paths) {
-        await emptyDirectoryContents(path8);
-      }
+      const cleanupResult = combineCleanupResults(
+        await Promise.all(paths.map((path8) => emptyDirectoryContents(path8)))
+      );
       const after = await getExistingDirectorySize(paths);
       return {
-        success: true,
+        success: cleanupResult.skippedEntries === 0 || cleanupResult.removedEntries > 0,
         reclaimedBytes: Math.max(0, before - after),
-        message: `${paths.length}\uAC1C Metro \uCE90\uC2DC \uB514\uB809\uD130\uB9AC\uB97C \uC815\uB9AC\uD588\uC2B5\uB2C8\uB2E4.`
+        message: cleanupResult.skippedEntries === 0 ? `${paths.length}\uAC1C Metro \uCE90\uC2DC \uB514\uB809\uD130\uB9AC\uB97C \uC815\uB9AC\uD588\uC2B5\uB2C8\uB2E4.` : formatDirectoryCleanupMessage(paths, cleanupResult)
       };
     }
   };
